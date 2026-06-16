@@ -1,0 +1,4 @@
+[submodule "meta-sdr"]
+    path = "/components/layers/meta-sdr"
+    url = https://github.com/balister/meta-sdr.git
+    branch = walnascar
