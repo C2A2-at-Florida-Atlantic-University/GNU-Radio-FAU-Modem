@@ -1,0 +1,11 @@
+# Ignore heavy, temporary cross-compilation artifacts
+**/build/
+**/images/
+**/components/plnx_workspace/
+**/*.jou
+**/*.log
+
+# Force Git to keep your critical project validation nodes
+!**/.petalinux/
+!**/config
+!**/system-user.dtsi
