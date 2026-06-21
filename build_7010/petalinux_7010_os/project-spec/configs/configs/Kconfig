@@ -9,11 +9,11 @@ config SYSTEM_ZYNQ
         bool "ZYNQ Configuration"
         help
           ZYNQ Configuration for petalinux project.
-          All these config options will be in /home/fpga/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/config
+          All these config options will be in /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/config
 
 config SUBSYSTEM_DISTRO_PETALINUX
         bool
         default y
         help
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/configs/Kconfig.main
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/configs/Kconfig.main

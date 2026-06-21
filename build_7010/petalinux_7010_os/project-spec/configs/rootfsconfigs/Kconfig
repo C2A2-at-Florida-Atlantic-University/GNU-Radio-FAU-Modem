@@ -8984,7 +8984,7 @@ config Init-manager-sysvinit
 endchoice
 endmenu
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/rootfsconfigs/Kconfig.user
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/rootfsconfigs/Kconfig.user
 
 menu "PetaLinux RootFS Settings"
 config ADD_EXTRA_USERS

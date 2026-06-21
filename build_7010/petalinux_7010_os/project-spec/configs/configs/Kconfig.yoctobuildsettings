@@ -27,13 +27,13 @@ endmenu
 endif
 
 if !SUBSYSTEM_DISTRO_PETALINUX
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/configs/Kconfig.yoctomachinesettings
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/configs/Kconfig.yoctomachinesettings
 endif
 
 if SUBSYSTEM_DISTRO_PETALINUX
 menu "Yocto Settings"
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/configs/Kconfig.yoctomachinesettings
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7010/petalinux_7010_os/project-spec/configs/configs/Kconfig.yoctomachinesettings
 
 if SUBSYSTEM_SDT_FLOW
 config MC_PLNX_IMAGES_LOCATION
