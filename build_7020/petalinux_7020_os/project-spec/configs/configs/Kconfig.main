@@ -33,22 +33,22 @@ config SUBSYSTEM_ENDIAN_LITTLE
 
 if SUBSYSTEM_DISTRO_PETALINUX
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.linuxcompselection
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.linuxcompselection
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.autoconfigsettings
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.autoconfigsettings
 
 endif
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.syshw
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.syshw
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.dtgsettings
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.dtgsettings
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.bootcompconfigurations
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.bootcompconfigurations
 
 if SUBSYSTEM_DISTRO_PETALINUX
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.imagepkgconfigurations
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.imagepkgconfigurations
 
 endif
 
-source /home/fpga/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.yoctobuildsettings
+source /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig.yoctobuildsettings

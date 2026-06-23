@@ -19,53 +19,39 @@ config SUBSYSTEM_COMPONENT_IMG_SEL
           build your bootloader.
 
 config SUBSYSTEM_COMPONENT_BOOTLOADER_AUTO_FSBL
-	bool "First Stage Bootloader"
+	bool
 	default y
 	depends on !SYSTEM_VERSAL
-	help
-	  If you select this option, PetaLinux will auto generate the first stage
-	  bootloader through xsct.The ELF file for the same is in <PROJECT>/images/linux.
-	  If you DONOT select this option, petalinux will not generate, config or
-	  build your bootloader.
 
 config SUBSYSTEM_COMPONENT_BOOTLOADER_NAME_FS__BOOT
 	bool
 	default y
-	depends on SUBSYSTEM_COMPONENT_BOOTLOADER_AUTO_FSBL && SUBSYSTEM_ARCH_MICROBLAZE
+	depends on SUBSYSTEM_ARCH_MICROBLAZE
 
 config SUBSYSTEM_COMPONENT_BOOTLOADER_NAME_ZYNQ_FSBL
 	bool
 	default y
-	depends on SUBSYSTEM_COMPONENT_BOOTLOADER_AUTO_FSBL && SUBSYSTEM_ARCH_ARM
+	depends on SUBSYSTEM_ARCH_ARM
 
 config SUBSYSTEM_COMPONENT_BOOTLOADER_NAME_ZYNQMP_FSBL
 	bool
 	default y
-	depends on SUBSYSTEM_COMPONENT_BOOTLOADER_AUTO_FSBL && SYSTEM_ZYNQMP
+	depends on SYSTEM_ZYNQMP
 
 config SUBSYSTEM_COMPONENT_PMU_FIRMWARE
-	bool "PMU Firmware"
+	bool
 	default y
 	depends on SYSTEM_ZYNQMP
-	help
-	 If you select this option, Petalinux will generate pmufw through xsct.
-	 If you DO NOT select this option, Petalinux will not generate build or config PMUFW
 
 config SUBSYSTEM_COMPONENT_PLM
-        bool "PLM"
+	bool
         default y
         depends on SYSTEM_VERSAL
-        help
-         If you select this option, Petalinux will generate plm through xsct.
-         If you DO NOT select this option, Petalinux will not generate build or config PLM
 
 config SUBSYSTEM_COMPONENT_PSM_FIRMWARE
-        bool "PSM Firmware"
+	bool
         default y
         depends on SYSTEM_VERSAL
-        help
-         If you select this option, Petalinux will generate psmfw through xsct.
-         If you DO NOT select this option, Petalinux will not generate build or config PSMFW
 
 choice
 prompt "u-boot"
