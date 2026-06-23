@@ -23,15 +23,6 @@ config SUBSYSTEM_ROOTFS_INITRD
 	  Choose this opion to configure your PetaLinux build to use
 	  kernel INITRD mechinsm for the root filesystem.
 
-config SUBSYSTEM_ROOTFS_JFFS2
-	bool "JFFS2"
-	help
-	  Choose this option to configure your PetaLinux build for the
-	  root filesystem to be mounted on a JFFS2 flash partition.
-
-	  You must also ensure that your Flash Partition Table (see below)
-	  contains a partition named "jffs2" and is of a suitable size.
-
 config SUBSYSTEM_ROOTFS_UBIFS
 	bool "UBI/UBIFS"
 	help
@@ -65,28 +56,6 @@ config SUBSYSTEM_ROOTFS_OTHER
 
 	  You will need to manually generate the Root FS image.
 
-endchoice
-
-choice
-prompt "jffs2 erase block size(KByte)"
-default SUBSYSTEM_JFFS2_ERASE_SIZE_8
-depends on SUBSYSTEM_ROOTFS_JFFS2
-config SUBSYSTEM_JFFS2_ERASE_SIZE_4
-	bool "jffs2 erase block size: 4KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_8
-	bool "jffs2 erase block size: 8KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_16
-	bool "jffs2 erase block size: 16KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_32
-	bool "jffs2 erase block size: 32KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_64
-	bool "jffs2 erase block size: 64KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_128
-	bool "jffs2 erase block size: 128KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_256
-	bool "jffs2 erase block size: 256KiB"
-config SUBSYSTEM_JFFS2_ERASE_SIZE_512
-	 bool "jffs2 erase block size: 512KiB"
 endchoice
 
 config SUBSYSTEM_NFSROOT_DIR
@@ -160,14 +129,14 @@ config SUBSYSTEM_UIMAGE_NAME
 
 config SUBSYSTEM_RFS_FORMATS
 	string "Root filesystem formats"
-	default "cpio cpio.gz cpio.gz.u-boot ext4 tar.gz jffs2" if SUBSYSTEM_ARCH_AARCH64
-	default "cpio cpio.gz cpio.gz.u-boot ext4 tar.gz jffs2" if SUBSYSTEM_ARCH_ARM
-	default "cpio cpio.gz cpio.gz.u-boot tar.gz jffs2" if SUBSYSTEM_ARCH_MICROBLAZE
+	default "cpio cpio.gz cpio.gz.u-boot ext4 tar.gz" if SUBSYSTEM_ARCH_AARCH64
+	default "cpio cpio.gz cpio.gz.u-boot ext4 tar.gz" if SUBSYSTEM_ARCH_ARM
+	default "cpio cpio.gz cpio.gz.u-boot tar.gz" if SUBSYSTEM_ARCH_MICROBLAZE
 	help
 	  Specifies the formats the build system uses during the build
 	  when creating the root filesystem.
 	  Supported image formats:
-	  tar.gz cpio cpio.gz.u-boot cpio.gz ext4 ext3 ext3.bz2 tar.bz2 cpio.bz2 ext4.gz jffs2
+	  tar.gz cpio cpio.gz.u-boot cpio.gz ext4 ext3 ext3.bz2 tar.bz2 cpio.bz2 ext4.gz
 
 config SUBSYSTEM_COPY_TO_TFTPBOOT
 	bool "Copy final images to tftpboot"

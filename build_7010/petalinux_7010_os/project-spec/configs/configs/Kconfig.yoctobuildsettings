@@ -101,9 +101,9 @@ config PRE_MIRROR_URL
 	pre-mirrors is used by bitbake to fetch sources from specified location first.
 	If sources are not available in pre-mirrors, bitbake then fetches from SRC_URI in the recipes.
 
-        path can be ftp, http, https or local directory.examples are
+        path can be ftp, https or local directory.examples are
         "file::///path/to/your/downloads/"
-        "http://example.com/your/downloadsmirrors/"
+        "https://example.com/your/downloadsmirrors/"
         "ftp://example.com/your/downloadsmirrors/"
 endmenu
 
@@ -132,7 +132,7 @@ config YOCTO_NETWORK_SSTATE_FEEDS_URL
 	help
 	 Provide Network sstate feed URI.
 	 The sstate cache will be pulled from these servers and used to build the components.
-	 E.g: http://someserver.tld/share/sstate/
+	 E.g: https://someserver.tld/share/sstate/
 endmenu
 
 config YOCTO_BB_NO_NETWORK

@@ -5711,21 +5711,6 @@ config packagegroup-core-x11-utils-dev
 	 help
 	
 endmenu
-menu "packagegroup-core-x11-base " 
-config packagegroup-core-x11-base  
-	 bool "packagegroup-core-x11-base"
-	 help
-	 Basic X11 session
-	
-config packagegroup-core-x11-base-dev  
-	 bool "packagegroup-core-x11-base-dev"
-	 help
-	
-config packagegroup-core-x11-base-dbg  
-	 bool "packagegroup-core-x11-base-dbg"
-	 help
-	
-endmenu
 menu "packagegroup-core-x11-xserver " 
 config packagegroup-core-x11-xserver  
 	 bool "packagegroup-core-x11-xserver"
@@ -8484,43 +8469,9 @@ endmenu
 endmenu
 
 menu "Petalinux Package Groups"
-menu "packagegroup-petalinux "
-config packagegroup-petalinux
-         bool "packagegroup-petalinux"
-         help
-	 Includes miscellaneous packages
-		bash 
-		bzip2 
-		flex 
-		gmp 
-		libnet 
-		libpng 
-		libusb-compat 
-		libusb1 
-		popt 
-		unzip 
-		zlib 
-		tcf-agent 
-		dnf 
-		libattr 
-		libinput 
-		gdb 
-		libftdi 
-		cmake  
-
-config packagegroup-petalinux-dev
-         bool "packagegroup-petalinux-dev"
-         help
-
-config packagegroup-petalinux-dbg
-         bool "packagegroup-petalinux-dbg"
-         help
-
-endmenu
-
-menu "packagegroup-petalinux-audio "
-config packagegroup-petalinux-audio
-         bool "packagegroup-petalinux-audio"
+menu "packagegroup-xilinx-audio "
+config packagegroup-xilinx-audio
+         bool "packagegroup-xilinx-audio"
          help
          Includes ALSA supported packages
                 alsa-lib
@@ -8530,57 +8481,39 @@ config packagegroup-petalinux-audio
                 alsa-utils-scripts
                 pulseaudio
                 sox
+                libasound
 
-config packagegroup-petalinux-audio-dbg
-         bool "packagegroup-petalinux-audio-dbg"
+config packagegroup-xilinx-audio-dbg
+         bool "packagegroup-xilinx-audio-dbg"
          help
 
-config packagegroup-petalinux-audio-dev
-         bool "packagegroup-petalinux-audio-dev"
-         help
-
-endmenu
-
-menu "packagegroup-petalinux-display-debug "
-config packagegroup-petalinux-display-debug
-         bool "packagegroup-petalinux-display-debug"
-         help
-	 Includes packages to test and debug display ports
-		libdrm :libdrm provides a user space library for accessing the DRM, \
-			direct rendering manager, on operating systems that support the ioctl interface
-		libdrm-tests 
-
-
-config packagegroup-petalinux-display-debug-dbg
-         bool "packagegroup-petalinux-display-debug-dbg"
-         help
-
-config packagegroup-petalinux-display-debug-dev
-         bool "packagegroup-petalinux-display-debug-dev"
+config packagegroup-xilinx-audio-dev
+         bool "packagegroup-xilinx-audio-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-lmsensors "
-config packagegroup-petalinux-lmsensors
-         bool "packagegroup-petalinux-lmsensors"
+
+menu "packagegroup-lmsensors "
+config packagegroup-lmsensors
+         bool "packagegroup-lmsensors"
          help
 	 Includes packages that provides tools and drivers for monitoring temperature and voltage.
 		lmsensors-sensors 
 		lmsensors-libsensors 
 		lmsensors-sensorsdetect
 
-config packagegroup-petalinux-lmsensors-dbg
-         bool "packagegroup-petalinux-lmsensors-dbg"
+config packagegroup-lmsensors-dbg
+         bool "packagegroup-lmsensors-dbg"
          help
 
-config packagegroup-petalinux-lmsensors-dev
-         bool "packagegroup-petalinux-lmsensors-dev"
+config packagegroup-lmsensors-dev
+         bool "packagegroup-lmsensors-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-matchbox "
-config packagegroup-petalinux-matchbox
-         bool "packagegroup-petalinux-matchbox"
+menu "packagegroup-xilinx-matchbox "
+config packagegroup-xilinx-matchbox
+         bool "packagegroup-xilinx-matchbox"
          help
 	 Includes Matchbox related packages
 		matchbox-config-gtk 
@@ -8595,39 +8528,18 @@ config packagegroup-petalinux-matchbox
 		matchbox-wm 
 		settings-daemon 
 
-config packagegroup-petalinux-matchbox-dbg
-         bool "packagegroup-petalinux-matchbox-dbg"
+config packagegroup-xilinx-matchbox-dbg
+         bool "packagegroup-xilinx-matchbox-dbg"
          help
 
-config packagegroup-petalinux-matchbox-dev
-         bool "packagegroup-petalinux-matchbox-dev"
-         help
-
-endmenu
-menu "packagegroup-petalinux-networking-debug"
-config packagegroup-petalinux-networking-debug
-         bool "packagegroup-petalinux-networking-debug"
-         help
-	 Includes packages to debug network related issues
-		tcpdump :tcpdump is a common packet analyzer that runs under the command line. 
-			It allows the user to display TCP/IP and other packets being transmitted 
-			or received over a network to which the computer is attached.
-
-		wireshark :used for network troubleshooting, analysis, software and communications 
-			  protocol development, and education.
-
-config packagegroup-petalinux-networking-debug-dbg
-         bool "packagegroup-petalinux-networking-debug-dbg"
-         help
-
-config packagegroup-petalinux-networking-debug-dev
-         bool "packagegroup-petalinux-networking-debug-dev"
+config packagegroup-xilinx-matchbox-dev
+         bool "packagegroup-xilinx-matchbox-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-networking-stack "
-config packagegroup-petalinux-networking-stack
-         bool "packagegroup-petalinux-networking-stack"
+menu "packagegroup-networking-stack "
+config packagegroup-networking-stack
+         bool "packagegroup-networking-stack"
          help
 	 Includes packages to extend network stack
 		ethtool :ethtool is a utility for Linux kernel-based operating system for displaying 
@@ -8646,42 +8558,20 @@ config packagegroup-petalinux-networking-stack
 		iptables 
 		rpcbind
 
-config packagegroup-petalinux-networking-stack-dbg
-         bool "packagegroup-petalinux-networking-stack-dbg"
+config packagegroup-networking-stack-dbg
+         bool "packagegroup-networking-stack-dbg"
          help
 
-config packagegroup-petalinux-networking-stack-dev
-         bool "packagegroup-petalinux-networking-stack-dev"
-         help
-
-endmenu
-
-
-menu "packagegroup-petalinux-openamp "
-config packagegroup-petalinux-openamp
-         bool "packagegroup-petalinux-openamp"
-         help
-	 Includes OpenAMP supported packages
-		libmetal 
-		open-amp 
-		rpmsg-echo-test 
-		rpmsg-mat-mul 
-		rpmsg-proxy-app 
-	 	libmetal-demos 
-		open-amp-demos
-
-config packagegroup-petalinux-openamp-dbg
-         bool "packagegroup-petalinux-openamp-dbg"
-         help
-
-config packagegroup-petalinux-openamp-dev
-         bool "packagegroup-petalinux-openamp-dev"
+config packagegroup-networking-stack-dev
+         bool "packagegroup-networking-stack-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-opencv "
-config packagegroup-petalinux-opencv
-         bool "packagegroup-petalinux-opencv"
+
+
+menu "packagegroup-opencv "
+config packagegroup-opencv
+         bool "packagegroup-opencv"
          help
 	 Includes opencv supported packages
 		opencv 
@@ -8693,42 +8583,18 @@ config packagegroup-petalinux-opencv
 		libopencv-calib3d 
 		libopencv-ccalib
 
-config packagegroup-petalinux-opencv-dbg
-         bool "packagegroup-petalinux-opencv-dbg"
+config packagegroup-opencv-dbg
+         bool "packagegroup-opencv-dbg"
          help
 
-config packagegroup-petalinux-opencv-dev
-         bool "packagegroup-petalinux-opencv-dev"
-         help
-
-endmenu
-menu "packagegroup-petalinux-python-modules "
-config packagegroup-petalinux-python-modules
-         bool "packagegroup-petalinux-python-modules"
-         help
-	 Includes python module packages
-		python3-pip
-		python-pip 
-		python3-multiprocessing
-		python-numpy 
-		python-scons 
-		python3-shell
-		python3-threading
-		python3-pyserial 
-		python-pyserial	
-
-config packagegroup-petalinux-python-modules-dbg
-         bool "packagegroup-petalinux-python-modules-dbg"
-         help
-
-config packagegroup-petalinux-python-modules-dev
-         bool "packagegroup-petalinux-python-modules-dev"
+config packagegroup-opencv-dev
+         bool "packagegroup-opencv-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-qt "
-config packagegroup-petalinux-qt
-         bool "packagegroup-petalinux-qt"
+menu "packagegroup-xilinx-qt "
+config packagegroup-xilinx-qt
+         bool "packagegroup-xilinx-qt"
          help
          Includes Qt supported packages
                 qtbase
@@ -8739,12 +8605,12 @@ config packagegroup-petalinux-qt
                 qtquickcontrols-qmlplugins
                 qtcharts
 
-config packagegroup-petalinux-qt-dbg
-         bool "packagegroup-petalinux-qt-dbg"
+config packagegroup-xilinx-qt-dbg
+         bool "packagegroup-xilinx-qt-dbg"
          help
 
-config packagegroup-petalinux-qt-dev
-         bool "packagegroup-petalinux-qt-dev"
+config packagegroup-xilinx-qt-dev
+         bool "packagegroup-xilinx-qt-dev"
          help
 
 config imageclass-populate-sdk-qt5
@@ -8753,13 +8619,13 @@ config imageclass-populate-sdk-qt5
                 Includes Qt5 host toolchain under sdk directory
 
 endmenu
-menu "packagegroup-petalinux-qt-extended "
-config packagegroup-petalinux-qt-extended
-         bool "packagegroup-petalinux-qt-extended"
+menu "packagegroup-xilinx-qt-extended "
+config packagegroup-xilinx-qt-extended
+         bool "packagegroup-xilinx-qt-extended"
          help
 	 Includes Qt additional supported packages
 		ruby 
-		packagegroup-petalinux-qt 
+		packagegroup-xilinx-qt
 		qtbase-mkspecs 
 		qtbase-plugins 
 		qtsystems-mkspecs 
@@ -8789,103 +8655,36 @@ config packagegroup-petalinux-qt-extended
 		qttranslations-qtxmlpatterns 
 		qtwebkit-mkspecs 
 
-config packagegroup-petalinux-qt-extended-dbg
-         bool "packagegroup-petalinux-qt-extended-dbg"
+config packagegroup-xilinx-qt-extended-dbg
+         bool "packagegroup-xilinx-qt-extended-dbg"
          help
 
-config packagegroup-petalinux-qt-extended-dev
-         bool "packagegroup-petalinux-qt-extended-dev"
+config packagegroup-xilinx-qt-extended-dev
+         bool "packagegroup-xilinx-qt-extended-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-self-hosted "
-config packagegroup-petalinux-self-hosted
-         bool "packagegroup-petalinux-self-hosted"
+menu "packagegroup-self-hosted "
+config packagegroup-self-hosted
+         bool "packagegroup-self-hosted"
          help
 	 Includes self hosted tools packages 
 		packagegroup-self-hosted 
 		whetstone 
 		vim 
 
-config packagegroup-petalinux-self-hosted-dbg
-         bool "packagegroup-petalinux-self-hosted-dbg"
+config packagegroup-self-hosted-dbg
+         bool "packagegroup-self-hosted-dbg"
          help
 
-config packagegroup-petalinux-self-hosted-dev
-         bool "packagegroup-petalinux-self-hosted-dev"
-         help
-
-endmenu
-menu "packagegroup-petalinux-utils "
-config packagegroup-petalinux-utils
-         bool "packagegroup-petalinux-utils"
-         help
-	 Includes miscellaneous utilities packages
-		util-linux 
-		cpufrequtils 
-		bridge-utils 
-		mtd-utils 
-		usbutils 
-		pciutils 
-		canutils 
-		i2c-tools 
-		smartmontools 
-		e2fsprogs 
-
-config packagegroup-petalinux-utils-dbg
-         bool "packagegroup-petalinux-utils-dbg"
-         help
-
-config packagegroup-petalinux-utils-dev
-         bool "packagegroup-petalinux-utils-dev"
+config packagegroup-self-hosted-dev
+         bool "packagegroup-self-hosted-dev"
          help
 
 endmenu
-menu "packagegroup-petalinux-v4lutils "
-config packagegroup-petalinux-v4lutils
-         bool "packagegroup-petalinux-v4lutils"
-         help
-	 Includes packages to handle multimedia data
-		v4l-utils 
-		yavta
-config packagegroup-petalinux-v4lutils-dbg
-         bool "packagegroup-petalinux-v4lutils-dbg"
-         help
-
-config packagegroup-petalinux-v4lutils-dev
-         bool "packagegroup-petalinux-v4lutils-dev"
-         help
-
-endmenu
-menu "packagegroup-petalinux-vitis-acceleration-essential "
-config packagegroup-petalinux-vitis-acceleration-essential
-         bool "packagegroup-petalinux-vitis-acceleration-essential"
-         help
-         Includes packages for Vitis compatible platforms
-                xrt
-                zocl
-                opencl-headers
-                packagegroup-petalinux-opencv
-                packagegroup-petalinux-x11
-                gdb
-                valgrind
-                resize-part
-                htop
-                iperf3
-                meson
-                dnf
-config packagegroup-petalinux-vitis-acceleration-essential-dbg
-         bool "packagegroup-petalinux-vitis-acceleration-essential-dbg"
-         help
-
-config packagegroup-petalinux-vitis-acceleration-essential-dev
-         bool "packagegroup-petalinux-vitis-acceleration-essential-dev"
-         help
-
-endmenu
-menu "packagegroup-petalinux-x11 "
-config packagegroup-petalinux-x11
-         bool "packagegroup-petalinux-x11"
+menu "packagegroup-core-x11 "
+config packagegroup-core-x11
+         bool "packagegroup-core-x11"
          help
 	 Includes X11 related packages
 		packagegroup-core-x11 
@@ -8899,12 +8698,12 @@ config packagegroup-petalinux-x11
 		dbus 
 		liberation-fonts
 
-config packagegroup-petalinux-x11-dbg
-         bool "packagegroup-petalinux-x11-dbg"
+config packagegroup-core-x11-dbg
+         bool "packagegroup-core-x11-dbg"
          help
 
-config packagegroup-petalinux-x11-dev
-         bool "packagegroup-petalinux-x11-dev"
+config packagegroup-core-x11-dev
+         bool "packagegroup-core-x11-dev"
          help
 
 endmenu
