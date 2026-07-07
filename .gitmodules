@@ -2,3 +2,6 @@
 	path = components/layers/meta-sdr
 	url = https://github.com/balister/meta-sdr.git
 	branch = walnascar
+[submodule "components/layers/meta-fau-modem"]
+	path = components/layers/meta-fau-modem
+	url = https://github.com/C2A2-at-Florida-Atlantic-University/GNU-Radio-FAU-Modem-Blocks.git
