@@ -141,6 +141,13 @@ PYDEPS=(
     "python3-pyzmq"     # import zmq (gnuradio-zeromq python side)
 )
 
+# Out-of-tree modem blocks (meta-fau-modem). Fatal if missing, same as in
+# extract_gnuradio.sh -- a test tarball without the modem blocks can't
+# exercise them.
+OOT_PKGS=(
+    "gr-fau-modem"
+)
+
 # TEST-ONLY packages: upstream QA/regression tests + the runner.
 # These let you exercise the build on-target (e.g. run gnuradio's ptest suite)
 # and are intentionally absent from the production payload. Missing ones are
@@ -248,7 +255,17 @@ extract_board() {
         fi
     done
 
-    # 4) TEST-ONLY packages (ptest suites + runner). Missing -> NOTE, not a
+    # 4) Out-of-tree modem blocks. Fatal if missing (see extract_gnuradio.sh).
+    for pkg in "${OOT_PKGS[@]}"; do
+        if extract_one_pkg "${pkg}" "${rpm_dir}" "${stage}"; then
+            extracted=$((extracted+1))
+        else
+            echo "  ERROR: OOT package '${pkg}' not found for ${board}." >&2
+            missing=$((missing+1))
+        fi
+    done
+
+    # 5) TEST-ONLY packages (ptest suites + runner). Missing -> NOTE, not a
     #    failure: a given test box may not have built every -ptest package, and
     #    their absence does not compromise the runtime payload itself.
     for dep in "${TESTPKGS[@]}"; do

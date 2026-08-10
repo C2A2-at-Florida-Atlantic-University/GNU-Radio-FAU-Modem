@@ -129,6 +129,15 @@ PYDEPS=(
     "python3-pyzmq"     # import zmq (gnuradio-zeromq python side)
 )
 
+# Out-of-tree modem blocks (meta-fau-modem). Carries the cpython-312 pybind
+# extension, libgnuradio-fau_modem.so.*, and the fau_source/fau_sink GRC
+# .block.yml. A missing package here is treated as fatal for the board (see
+# the extraction loop below) rather than just a WARNING: this is the whole
+# point of building the tarball.
+OOT_PKGS=(
+    "gr-fau-modem"
+)
+
 overall_rc=0
 
 # Extract a single package's RPM (resolved by glob) into the staging tree.
@@ -222,6 +231,19 @@ extract_board() {
             extracted=$((extracted+1))
         else
             echo "  WARNING: python dependency '${dep}' not found." >&2
+            missing=$((missing+1))
+        fi
+    done
+
+    # 4) Out-of-tree modem blocks. Fatal if missing: unlike DEPLIBS (where a
+    #    gap just means an unresolved-symbol warning below) or PYDEPS, a
+    #    missing gr-fau-modem means the tarball has no modem blocks at all,
+    #    which defeats the entire point of packaging it.
+    for pkg in "${OOT_PKGS[@]}"; do
+        if extract_one_pkg "${pkg}" "${rpm_dir}" "${stage}"; then
+            extracted=$((extracted+1))
+        else
+            echo "  ERROR: OOT package '${pkg}' not found for ${board}." >&2
             missing=$((missing+1))
         fi
     done

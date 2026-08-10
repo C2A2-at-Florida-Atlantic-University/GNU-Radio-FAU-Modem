@@ -9,3 +9,5 @@
 !**/.petalinux/
 !**/config
 !**/system-user.dtsi
+
+modem_reference
