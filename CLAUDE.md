@@ -17,7 +17,10 @@ side of `build_7010/`/`build_7020/`.
   first, then bump the gitlink in the superproject.
 - **`modem_reference/scripts/`** is the ground-truth Python reference driver
   (bare `/dev/mem` + `mmap`, no kernel driver) that the C++ blocks are ported
-  from. Treat it as the spec, not as code to keep running.
+  from. Treat it as the spec, not as code to keep running. **A newer copy
+  lives outside this repo at `/home/gabeg/repos/UWM-dev/scripts/{tx,rx}/`** --
+  prefer it; the DMA-layer files are identical but the higher layers are
+  ahead (see the 2026-08-25 re-sync section below).
 - **`xsas/`** holds the hardware description files. Current: `m10_dac_iq_v6.xsa`
   (TX, 7010) and `m20_dac_iq_v6.xsa` (RX, 7020 — despite the "dac" in the
   filename, it's the ADC/RX design; MM2S=0/S2MM=1). Older XSAs are in
@@ -42,7 +45,7 @@ side of `build_7010/`/`build_7020/`.
 | DDS PINC / TVALID | `0x42200000` / `0x42210000` | same |
 | DMA masters | MM2S+SG on HP0 | S2MM on HP0, SG on HP1 |
 
-All unfenced over `0x00000000`–`0x1FFFFFFF`. **Neither bitstream connects the
+All unfenced over `0x00000000`–`0x1FFFFFFF`. DMA window: **0x1F000000, 16 MiB** (the top 16 MiB, already outside System RAM — see step 2). **Neither bitstream connects the
 DMA interrupt** (`mm2s_introut`/`s2mm_introut` have no `SIGNAME`) — polling is
 mandatory, there is no dmaengine channel and no `/dev/uio*`.
 
@@ -204,6 +207,238 @@ ask for a commit this session.
 
 ---
 
+## Re-sync against the newer reference scripts (2026-08-25 session)
+
+`/home/gabeg/repos/UWM-dev/scripts/{tx,rx}/` is a **newer copy** of the same
+reference driver set as `modem_reference/scripts/`. Diffed both trees this
+session: `dma_tx_sg_16m.py`, `dma_rx_sg_16m.py`, `bpsk_dma.py` and
+`rx_iq_sg_capture_frame_ids.py` are byte-identical, so the verified register
+map, arming order and teardown discipline above all still hold. The only
+deltas were `--tx-scale` on the TX path and demod/EVM work on the RX path
+(the latter lives above the DMA layer and is out of scope per the last
+section). Prefer the `UWM-dev` copy as the reference from here on.
+
+Everything below was cross-checked line by line against those scripts and is
+built and packaged (`petalinux-build -c gr-fau-modem` through
+`do_package_qa`/`do_package_write_rpm`, RPM extracted and symbol-checked).
+**Still nothing has run on Zynq hardware.**
+
+### Behaviour brought over from the reference
+
+- **`fau_sink` gained `tx_scale`** (`--tx-scale` in
+  `tx_iq_sg_cyclic_frame_ids.py` / `frame_ids_tx.py`): a linear gain folded
+  into the Q15 conversion scale, so it costs nothing extra.
+  `volk_32f_s32f_convert_16i` saturates, which is what makes `tx_scale > 1`
+  a clip rather than a phase inversion, matching the reference's
+  `np.clip` in `pack_q15`. Runtime-settable (`set_tx_scale()`); the block
+  counts saturated Q15 components and exposes them as `clipped()`, the
+  streaming equivalent of the reference's `clipped_frac`.
+- **`fau_source` splits `malformed()` into `acquisition_drops()` +
+  `stream_drops()`**, the same distinction `program_s2mm_capture()` makes:
+  one short packet before the first good buffer is the ADC datapath being
+  mid-frame at arm time and is benign; anything after that is a real
+  frame_len/bd_samples divergence.
+- **Stall watchdog on both blocks** (`poll_timeout`, default 20 s, the
+  reference's `--poll-timeout`). Exists because the engine can wedge with
+  *no* DMASR error bit set -- the error-bit check alone polls straight past
+  that. Raised at arm time to at least 3 BD periods so a low sample rate
+  with a large `bd_samples` can't false-positive. 0 disables. On trip:
+  dump + `WORK_DONE`.
+- **Ring-integrity watchdog on both blocks**, 250 ms cadence, matching the
+  reference's mid-capture `_verify_ring()`. Unlike the reference (whose job
+  was to diagnose) this one is **fatal**: a drifted `BUFADDR` means the
+  engine is about to read/write memory it does not own.
+- **`sg_ring::verify()` widened** from NXTDESC-only to NXTDESC +
+  NXTDESC_MSB + a BUFADDR range check, and now runs **unconditionally at
+  arm** (not just under `verbose`) as the reference's BASELINE check --
+  which distinguishes a stale/incoherent descriptor mapping from a runtime
+  stray write. `sg_ring::dump()` gained the reference's `CURDESC valid ring
+  slot` verdict and per-BD `BAD_BUF` flag, and `fatal()` now dumps
+  unconditionally (the state is frozen only at the fault instant).
+- **`bd_samples * 4` is now validated against the 26-bit SG length field**,
+  as `_write_bd()` does.
+- `sg_ring::config` fields got default member initializers --
+  `apps/fau_ringtest.cc` declares one and assigns field-by-field, so the new
+  `buf_region_bytes` would otherwise have been stack garbage.
+
+### Build-system trap fixed while verifying
+
+`GR_PYBIND_MAKE_OOT` declares the docstring-template -> `*_pydoc.h` copy
+with an OUTPUT of `docstring_status` and **no DEPENDS**, so once that file
+exists the copy never runs again. Under `externalsrc` (build tree persists)
+editing a `*_pydoc_template.h` silently does nothing and the *next* build
+fails on an undeclared `__doc_*` symbol. Hit this for real. Fixed in
+`python/fau_modem/bindings/CMakeLists.txt` with an
+`add_custom_command(OUTPUT ... APPEND DEPENDS <templates>)`.
+
+Remember `md5sum include/gnuradio/fau_modem/fau_{source,sink}.h` ->
+`BINDTOOL_HEADER_FILE_HASH` after every header edit (both were updated).
+
+### Three wrong hypotheses on the silent-DAC bug (kept so they are not retried)
+
+All three were investigated on hardware and are DISPROVEN. The root cause is
+the section below. Recorded because each looks plausible from the code.
+
+1. **GPIO `TRI` reset out from under us.** Wrong. Verified against
+   `xsas/m10_dac_iq_v6.xsa` (`SDUAM.hwh`): all four TX AXI GPIOs
+   (`Phase_inc_reg_tdata`, `Phase_inc_reg_tvalid`, `dma_dds_select`,
+   `interpolator_gpio`) expose **only `gpio_io_o`** -- no `gpio_io_t`, no
+   `gpio_io_io`. There is no tristate buffer, so `TRI` is a no-op on this
+   bitstream and the DATA register drives the fabric net directly.
+   `cic_rate`/`dds_nco` still write TRI before DATA, because that is what the
+   reference drivers do and it costs one register write, but it fixes nothing.
+
+2. **The SLCR fabric reset wedging the DAC CDC FIFO.** Unproven and almost
+   certainly not it -- removing the fabric reset from the TX path changed
+   nothing on hardware. The observation behind it is real and worth keeping:
+   `clk_wiz_DAC.resetn` is wired straight to `FCLK_RESET0_N`, so an SLCR
+   fabric reset does cycle the whole 10 MHz DAC clock domain including the
+   CDC FIFO into `AXIS_S_to_AD9764_0`. `fau_sink` therefore uses
+   `DMACR.Reset` (what the TX reference has always done) rather than the
+   fabric reset -- justified as the narrower hammer, NOT as a fix.
+
+3. **"`set_output_multiple()` guarantees `work()` sees a full block."**
+   Wrong, and this one WAS the bug -- see below.
+
+Facts the XSA established along the way, worth not re-deriving:
+
+- The GPIOs' `s_axi_aresetn` is `rst_ps7_0_100M_peripheral_aresetn` <-
+  `FCLK_RESET0_N`, so a fabric reset DOES clear their DATA registers.
+  `fau_source` still fabric-resets, so it MUST reprogram NCO/CIC/frame_len
+  after every arm.
+- There is **no `axis_tlast_gen` and no frame_len/tlast GPIO on the TX board
+  at all** -- `fau_sink` is right not to touch 0x41200000/0x41210000. TLAST
+  comes from the BD EOF flag.
+- `axis_mux_2x1_0.sel <- dma_dds_select_gpio_io_o` (s0 = DMA, s1 = DDS), and
+  `m_tready <- AND(cic_compiler_I/Q.s_axis_data_tready)`. The MM2S channel's
+  backpressure comes from the CICs, **never from the DAC FIFO** -- so BDs
+  retiring at the correct rate says nothing about whether anything reaches
+  the DAC. This is why every DMA-side statistic looked perfect throughout.
+
+### ROOT CAUSE (confirmed on hardware): fau_sink required a whole BD per work() call
+
+Confirmed by the data/silence split, at the default `bd_samples=8192`:
+
+    BDs moved: 19811 (data: 0, silence: 19811)   <- flat DAC
+    BDs moved:  5320 (data: 5316, silence: 4)    <- --bd-samples 1024, sine on the scope
+
+`work()` was being called continuously, but always with
+`noutput_items < bd_samples`, so the real-data loop never ran one iteration
+and the prefill top-up filled the ring with silence forever. Every DMA-side
+statistic looked perfect while the DAC transmitted zeroes.
+
+**The mistaken assumption:** that `set_output_multiple(bd_samples)`
+guarantees `work()` sees a nonzero multiple of it. It does **not** for a
+sink. GNU Radio applies that rounding to a block's own OUTPUT buffers; a
+sink has none, and `block_executor`'s sink branch offers whatever the
+upstream buffer happens to hold. (The 3.10.12 source in this tree *does*
+round in the sink branch -- the board runs 3.11, which does not. Do not
+verify runtime behaviour against the 3.10 tree in `build_*/`.)
+
+**Fix:** `fau_sink::work()` now accepts ANY `noutput_items` and carries a
+partial conversion across calls in `d_stage_fill`, posting a BD only when
+`d_stage` is full. `set_output_multiple()` is gone from `fau_sink` (it never
+constrained the sink and only oversized the upstream buffer). `d_stage_fill`
+resets at every arm so a fragment of the old stream can't splice into the new
+one. `fau_source` keeps `set_output_multiple` -- for a source it IS honoured
+(`min_available_space()` rounds down to it and returns 0 -> BLKD_OUT rather
+than calling `work()` short), so the source never had this bug.
+
+**Never assume a sink's `work()` gets a full block. Accumulate.**
+
+### Process lessons from this bug
+
+What resolved it was instrumentation, not analysis. Splitting `bds_moved()`
+into data vs silence turned an unfalsifiable symptom into a one-line answer.
+Two things had made that impossible for three rounds:
+
+- `bds_moved()` counted silence BDs, so "BDs moved: 1233, underruns: 0" was
+  equally consistent with complete success and with total failure.
+- `examples/` and `apps/` were never installed or packaged, so `tx_sine.py`
+  could not be refreshed by redeploying (every board copy was a hand-scp,
+  and a stale one reported through old code paths) and `fau_ringtest` -- the
+  test this file names as the gate on the whole tail-bump design -- could not
+  be run at all. Both now ship; see `apps/CMakeLists.txt`,
+  `examples/CMakeLists.txt` and `FILES:${PN}` in the recipe.
+
+**When a symptom is consistent with two opposite causes, add the measurement
+that separates them before proposing a third hypothesis.**
+
+**Do not verify GNU Radio runtime behaviour against the 3.10.12 source tree
+in `build_*/`** -- the boards run 3.11, and the sink branch of
+`block_executor` differs in exactly the way that mattered here.
+
+### Still deliberately NOT done from the reference
+
+TX-side `frame_len`/`tlast_gen` GPIOs (0x41200000/0x41210000) exist in
+`bpsk_dma.py` but the IQ TX path never calls them -- TLAST comes from the BD
+EOF flag, so `fau_sink` correctly does not touch them. The reference's
+64 KiB `SG_SEGMENT_BYTES` split is its own choice, not a hardware limit; one
+BD per `bd_samples` is equivalent as long as `bd_samples == frame_words`.
+RX gain (`gain-control/dac7512.py`) is still item 5 below.
+
+---
+
+## Example scripts generate continuously, they do not replay buffers (2026-08-26)
+
+`tx_chirp.py` and `tx_sine.py`'s phase path both used to precompute a whole
+period into a `blocks.vector_source_c` and replay it. Both now synthesise on
+the fly with stock C++ blocks, so memory is O(1) and no `--period` /
+`--phase-period` bound is needed. **Do not reintroduce a precomputed buffer
+into these scripts.**
+
+- **Chirp**: `analog.sig_source_f(GR_SAW_WAVE)` carrying instantaneous
+  frequency in **Hz** (amplitude = span, offset = the starting edge, so a
+  negative span is a down-chirp with no special casing) ->
+  `frequency_modulator_fc` with `sensitivity = 2*pi/samp_rate`, which is
+  exactly what makes the sawtooth read as Hz -> `multiply_const_cc` for
+  amplitude (the FM block always emits unit magnitude).
+- `tx_chirp.py`'s CLI is **`--bandwidth` / `--direction {up,down}` /
+  `--period`**, not a start/stop pair: the band is always centred on `--nco`,
+  and `sweep_edges()` turns that into the `(f_start, f_stop)` baseband offsets
+  the sawtooth needs. `--bandwidth` is capped at `--samp-rate` (the sweep
+  reaches +/- bandwidth/2 at baseband), and the banner warns when
+  `nco - bandwidth/2` goes below DC, where the low end folds back up as its
+  mirror instead of continuing down.
+- GR's saw is `offset + ampl*(phase/2pi) + ampl/2` and its NCO starts at
+  phase 0, i.e. **mid-ramp**. `saw.set_phase(-math.pi)` puts the first sample
+  at the starting edge. Verified present in the board's GR 3.11 pybind module;
+  wrapped in `try/except AttributeError` anyway since it is cosmetic and only
+  affects the first sweep.
+- The FM phase accumulator never resets, so **the repeat seam is
+  phase-continuous for free** -- only frequency steps there. This deletes the
+  `wrap_phase_deg` warning the precompute version had to print.
+- **Phase staircase** (`tx_sine --phase-shift`): `vector_source_c` now holds
+  only the 2 or 4 distinct phasors, and `blocks.repeat(sizeof_gr_complex,
+  hold)` stretches each across the hold. `--phase-period 2` at 400 ksps went
+  from a 3.2 Msample / 25 MiB pattern to 4 stored complex numbers.
+
+Measured on the host (GR 3.10.1.1; the block semantics used here are
+unchanged in 3.11, and `repeat`, `frequency_modulator_fc`,
+`sig_source<float>` and `set_phase` were all `nm`/binding-confirmed in the
+board's `libgnuradio-{analog,blocks}.so.3.11.0git`):
+
+- sweep span is exact every sweep (`min/max` land on the requested band
+  edges), and 99.9% of samples are within ~0.5 Hz of the ideal ramp, checked
+  up/down, from DC, at the full-rate band limit, and at two sample rates.
+- `sig_source_f`'s float NCO makes one sweep 4000 or 4001 samples instead of
+  exactly 4000 -- **~3 ppm of slip in when the sweep restarts** (6 samples
+  over 2000 sweeps). The sweep itself is never distorted; only the repeat
+  boundary walks. Harmless for a free-running chirp, but it means the closed
+  form is still the right tool if a sweep ever has to align to an external
+  time reference.
+
+These scripts depend on nothing outside stock GNU Radio plus the already
+shipped `fau_tx_common.py` and the unchanged `fau_sink` API, so a revised
+`tx_chirp.py` can be dropped onto a board **without redeploying the tarball**
+-- scp it next to `fau_tx_common.py` in
+`/usr/share/gnuradio/fau_modem/examples/`.
+
+WAV/file playback needs no new machinery either: `blocks.wavfile_source(...,
+repeat=True)` is already streaming. `modem_reference`'s `wav_tx.py` frames +
+BPSK-modulates above the DMA layer, which stays out of scope (see the last
+section).
+
 ## What's left, in order
 
 ### 1. Bring-up tests on hardware (before trusting the blocks at all)
@@ -230,19 +465,55 @@ All three have `allow_unreserved`-equivalent behavior built in (they warn
 but continue if the DT reservation isn't there yet, since they need to run
 *before* that prerequisite exists to prove it's needed).
 
-### 2. Device tree: reserved-memory node (owned by the user, per this session's decision)
+### 2. Device tree: RESOLVED by moving the window, no DT change needed
 
-Not done this session — deliberately deferred as a "prerequisite you own."
-Needed before `fau_source`/`fau_sink` can `start()` without
-`allow_unreserved=true` (which is a deliberate escape hatch for exactly this
-gap, not a substitute for doing it).
+Observed on the 7010 board (`sudo cat /proc/iomem`, and it MUST be sudo -- see
+below):
 
-Add to **both** boards'
-`project-spec/meta-user/recipes-bsp/device-tree/files/system-user.dtsi`,
-**and** the U-Boot copies under
-`project-spec/meta-user/meta-xilinx-tools/recipes-bsp/uboot-device-tree/files/system-user.dtsi`
-(the U-Boot copy matters — the ~59 MB initrd can get relocated into this
-window by `boot_ramdisk_high()` if `initrd_high` is unset):
+    00000000-1effffff : System RAM
+
+One System RAM range, ending at `0x1EFFFFFF`. So `0x1F000000-0x1FFFFFFF`, the
+top 16 MiB, is already carved out of kernel-managed memory, and there is no
+fragmentation anywhere else. That is byte-for-byte the window the RX reference
+driver uses (`dma_rx_sg_16m.py`: `S2MM_BUF_PHYS = 0x1F000000`,
+`S2MM_BD_PHYS = 0x1FF00000`) and calls "the only region actually carved out of
+kernel RAM on this board".
+
+`dma_layout` previously asked for **32 MiB at 0x1E000000**, which straddled the
+boundary: its lower half sat inside System RAM, so `reserved_window_ok()`
+refused to arm and every run needed `allow_unreserved` -- i.e. the DMA writing
+into kernel-managed pages. **The window was simply in the wrong place.** It is
+now `WINDOW_PHYS = 0x1F000000`, `WINDOW_SIZE = 0x01000000`, which makes the
+derived offsets land the ring at `0x1FF00000` and buffers at `0x1F000000`,
+identical to the reference. No `system-user.dtsi` edit, no device-tree rebuild,
+no `BOOT.BIN` regeneration.
+
+Budget: 15 MiB of buffer region. `fau_sink` at the defaults needs
+`(16+1) * 8192 * 4` = 544 KiB, so this is not a constraint. The GRC asserts
+were updated from 31 MiB to 15 MiB to match.
+
+**UNVERIFIED, and the one thing left to confirm:** `/proc/device-tree/
+reserved-memory/` contains a node named `buffer@0x0E00000`. Node names are
+cosmetic (and this one is hand-written -- a real DT unit-address has no `0x`
+prefix), so it may simply be mislabelled. If its `reg` really is at
+`0x0E000000`, then something else trims the top 16 MiB and our window may be
+sharing a region that node owns. `tx_sine.py`'s preflight now parses every
+reserved-memory child's `reg`/`no-map` and says whether our window is inside
+one, so the next run answers this. Watch for it.
+
+**`/proc/iomem` must be read as root.** Linux zeroes every address for a reader
+without `CAP_SYS_ADMIN`, so an unprivileged `cat` shows
+`00000000-00000000 : System RAM` and looks like a clean window. That also used
+to defeat `reserved_window_ok()` silently -- degenerate ranges overlap nothing,
+so the guard passed. It now detects the all-zero case and fails as
+unverifiable, and the "cannot open /proc/iomem" path went from fail-open to
+fail-closed. Never name-match device-tree nodes either: the old preflight
+looked for a node literally called `fau-dma`, reported "ABSENT", and was
+technically true and completely useless.
+
+If a future board genuinely needs a different window, the node to add to BOTH
+boards' `system-user.dtsi` (and the U-Boot copy under
+`meta-xilinx-tools/recipes-bsp/uboot-device-tree/`) is:
 
 ```dts
 / {
@@ -251,51 +522,20 @@ window by `boot_ramdisk_high()` if `initrd_high` is unset):
 		#size-cells = <1>;
 		ranges;
 
-		fau_dma_reserved: fau-dma@1e000000 {
+		fau_dma_reserved: fau-dma@1f000000 {
 			no-map;
-			reg = <0x1e000000 0x02000000>;   /* top 32 MiB of 512 MB DDR */
+			reg = <0x1f000000 0x01000000>;
 		};
 	};
 };
 ```
 
-Plus, **Linux copies only** (not U-Boot — an unresolved label there is a
-hard `dtc` error since the U-Boot DT assembly may not pull in `pl.dtsi`):
-
-```dts
-&axi_dma_0 { status = "disabled"; };
-```
-
-`no-map` is correct — not primarily for uncachedness (that's `O_SYNC` on the
-`open()` call, already handled in `hw/mmio.cc`), but because it keeps the
-kernel from creating a cached linear-map alias (a mismatched-attribute
-violation on ARMv7), keeps the page allocator out, and removes the range
-from `/proc/iomem` as System RAM (which is exactly what
-`hw::reserved_window_ok()` checks for). Do **not** use `reusable` or
-`compatible = "shared-dma-pool"` — those hand the region to a kernel CMA
-driver that doesn't exist here.
-
-`CONFIG_STRICT_DEVMEM` was confirmed **off** in both kernel configs this
-session, so no kernel config change is strictly required, but pin it
-defensively in `project-spec/meta-user/recipes-kernel/linux/linux-xlnx/bsp.cfg`
-(currently 0 bytes, already wired into the bbappend) so a future kernel bump
-can't silently break this:
-
-```
-CONFIG_DEVMEM=y
-# CONFIG_STRICT_DEVMEM is not set
-# CONFIG_IO_STRICT_DEVMEM is not set
-CONFIG_OF_RESERVED_MEM=y
-```
-
-**Verify on target after flashing:**
-```
-grep -i "system ram" /proc/iomem          # must end at 0x1dffffff
-ls /proc/device-tree/reserved-memory/     # fau-dma@1e000000 present
-xxd /proc/device-tree/chosen/linux,initrd-start   # must be < 0x1E000000
-```
-If the initrd check fails, set `initrd_high=0x1dffffff` (and `fdt_high`
-likewise) in the U-Boot environment.
+`no-map` is correct: it keeps the kernel from creating a cached linear-map
+alias (a mismatched-attribute violation on ARMv7), keeps the page allocator
+out, and removes the range from `/proc/iomem` as System RAM. Do **not** use
+`reusable` or `compatible = "shared-dma-pool"` -- those hand the region to a
+CMA driver that does not exist here. `CONFIG_STRICT_DEVMEM` was confirmed off
+on both boards.
 
 ### 3. Import the current XSAs into both PetaLinux projects
 

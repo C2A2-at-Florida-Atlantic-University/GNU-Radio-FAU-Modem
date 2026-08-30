@@ -1,14 +1,14 @@
-2026-06-23 18:55:09,401 - [DEBUG] Using xsct from : /opt/petalinux/2024.2/components/xsct/bin/xsct
-2026-06-23 18:55:09,401 - [INFO] Getting Platform info from HW file
-2026-06-23 18:55:09,401 - [DEBUG] Using the soc_family specified by user:zynq
-2026-06-23 18:55:09,413 - [DEBUG] Hardware Configuration:
-2026-06-23 18:55:09,413 - [DEBUG] MACHINE     = "None"
-2026-06-23 18:55:09,413 - [DEBUG] DEVICE_ID   = "7z020"
-2026-06-23 18:55:09,413 - [DEBUG] SOC_FAMILY  = "zynq"
-2026-06-23 18:55:09,413 - [DEBUG] SOC_VARIANT = ""
-2026-06-23 18:55:09,413 - [INFO] Silentconfig project
-2026-06-23 18:55:09,413 - [DEBUG] Running CMD: yes "" | env KCONFIG_CONFIG=/home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/config conf /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig
-2026-06-23 18:55:09,421 - [DEBUG] *
+2026-08-27 02:09:55,789 - [DEBUG] Using xsct from : /opt/petalinux/2024.2/components/xsct/bin/xsct
+2026-08-27 02:09:55,789 - [INFO] Getting Platform info from HW file
+2026-08-27 02:09:55,789 - [DEBUG] Using the soc_family specified by user:zynq
+2026-08-27 02:09:55,801 - [DEBUG] Hardware Configuration:
+2026-08-27 02:09:55,801 - [DEBUG] MACHINE     = "None"
+2026-08-27 02:09:55,801 - [DEBUG] DEVICE_ID   = "7z020"
+2026-08-27 02:09:55,801 - [DEBUG] SOC_FAMILY  = "zynq"
+2026-08-27 02:09:55,801 - [DEBUG] SOC_VARIANT = ""
+2026-08-27 02:09:55,801 - [INFO] Silentconfig project
+2026-08-27 02:09:55,801 - [DEBUG] Running CMD: yes "" | env KCONFIG_CONFIG=/home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/config conf /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/configs/Kconfig
+2026-08-27 02:09:55,808 - [DEBUG] *
 * PetaLinux System Configuration
 *
 ZYNQ Configuration (SYSTEM_ZYNQ) [Y/?] y
@@ -229,13 +229,14 @@ Enable Buildtools Extended (YOCTO_BUILDTOOLS_EXTENDED) [N/y/?]
 * User Layers
 *
 user layer 0 (USER_LAYER_0) [/home/gabeg/repos/GNU-Radio-FAU-Modem/components/layers/meta-sdr] 
-  user layer 1 (USER_LAYER_1) [] 
+  user layer 1 (USER_LAYER_1) [/home/gabeg/repos/GNU-Radio-FAU-Modem/components/layers/meta-fau-modem] 
+user layer 2 (USER_LAYER_2) [] 
 #
 # configuration written to /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/config
 #
-2026-06-23 18:55:09,457 - [INFO] Silentconfig rootfs
-2026-06-23 18:55:09,458 - [DEBUG] Running CMD: yes "" | env KCONFIG_CONFIG=/home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/rootfs_config conf /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/rootfsconfigs/Kconfig
-2026-06-23 18:55:09,473 - [DEBUG] *
+2026-08-27 02:09:55,846 - [INFO] Silentconfig rootfs
+2026-08-27 02:09:55,846 - [DEBUG] Running CMD: yes "" | env KCONFIG_CONFIG=/home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/rootfs_config conf /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/rootfsconfigs/Kconfig
+2026-08-27 02:09:55,859 - [DEBUG] *
 * Configuration
 *
 *
@@ -3533,7 +3534,7 @@ Add Users to Sudo users (ADD_USERS_TO_SUDOERS) [petalinux]
 #
 # configuration written to /home/gabeg/repos/GNU-Radio-FAU-Modem/build_7020/petalinux_7020_os/project-spec/configs/rootfs_config
 #
-2026-06-23 18:55:09,479 - [INFO] Generating configuration files
-2026-06-23 18:55:09,480 - [DEBUG] No multilibs enabled.
-2026-06-23 18:55:09,480 - [DEBUG] No multilibs enabled.
-2026-06-23 18:55:09,492 - [DEBUG] Shutting down bitbake
+2026-08-27 02:09:55,865 - [INFO] Generating configuration files
+2026-08-27 02:09:55,866 - [DEBUG] No multilibs enabled.
+2026-08-27 02:09:55,867 - [DEBUG] No multilibs enabled.
+2026-08-27 02:09:55,879 - [DEBUG] Shutting down bitbake

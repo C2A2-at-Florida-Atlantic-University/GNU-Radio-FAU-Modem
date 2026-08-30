@@ -2,7 +2,8 @@
 #
 # extract_gnuradio.bash
 # Extract the headless GNU Radio runtime payload from the PetaLinux RPM deploy
-# pools for BOTH the 7010 and 7020 builds, producing one .tar.gz per board.
+# pools for BOTH the 7010 and 7020 builds, producing one gzip-compressed
+# tar.gz tarball per board.
 #
 # Behavior:
 #   - Iterates over both boards. If a board's deploy dir or required RPMs are
@@ -24,6 +25,20 @@ set -u
 
 REPO_ROOT="../"
 ARCH="cortexa9t2hf_neon"
+
+# Tarball is always gzip — gunzip is always available on the target image,
+# unlike xz/bzip2's decompressor applets which are build-time options. See
+# docs/DEPLOY.headless_tarball.txt for the board-side extract procedure.
+COMPRESS_CMD="gzip -9"
+TAR_EXT="tar.gz"
+TARGET_DECOMP="zcat"
+
+# Fail early and loudly on the HOST rather than emitting a truncated tarball
+# from a broken pipe halfway through the run.
+if ! command -v gzip > /dev/null; then
+    echo "ERROR: gzip not found on this host." >&2
+    exit 2
+fi
 
 # Board name -> its PetaLinux project path (relative to REPO_ROOT).
 BOARDS=("7010" "7020")
@@ -179,7 +194,7 @@ extract_board() {
     local board="$1"
     local rpm_dir="${REPO_ROOT}/${PROJ[$board]}/build/tmp/deploy/rpm/${ARCH}"
     local stage="${HOME}/gnuradio_headless_staging_${board}"
-    local out="${HOME}/gnuradio_headless_${board}.tar.gz"
+    local out="${HOME}/gnuradio_headless_${board}.${TAR_EXT}"
 
     echo "==================================================================="
     echo "Board ${board}"
@@ -390,8 +405,27 @@ extract_board() {
         fi
     fi
 
-    tar -czf "${out}" -C "${stage}" usr/
+    # Explicit pipe rather than `tar -I`/`-J`: --use-compress-program's handling
+    # of a command WITH arguments varies across tar versions, and the pipe makes
+    # both exit statuses checkable. ${COMPRESS_CMD} is deliberately unquoted so
+    # it word-splits into command + flags — not a quoting bug.
+    rm -f "${out}"
+    tar -cf - -C "${stage}" usr/ | ${COMPRESS_CMD} > "${out}"
+    local rcs=("${PIPESTATUS[@]}")
+    if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
+        echo "  WARNING: packaging failed for ${board}" \
+             "(tar=${rcs[0]} gzip=${rcs[1]}). Removing partial tarball." >&2
+        rm -f "${out}"
+        overall_rc=1
+        return
+    fi
+
     echo "  OK: headless ${board} package -> ${out}"
+    echo "      size: $(du -h "${out}" | cut -f1) (gzip)"
+    # Emit the matching extract line so whoever deploys this does not have to
+    # guess which decompressor the tarball was built with. Piped, not `tar -xJf`:
+    # busybox tar's seamless-xz autodetect is a separate build-time option.
+    echo "      on-target: ${TARGET_DECOMP} $(basename "${out}") | tar -xf - -C /"
 }
 
 for b in "${BOARDS[@]}"; do

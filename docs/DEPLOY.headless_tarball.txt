@@ -1,0 +1,175 @@
+===============================================================================
+DEPLOYING THE HEADLESS GNU RADIO TARBALL TO A BOARD
+===============================================================================
+
+Applies to the tarballs produced by:
+
+    scripts/extract_gnuradio.sh          -> ~/gnuradio_headless_<board>.tar.xz
+    scripts/extract_gnuradio_tests.sh    -> ~/gnuradio_headless_test_<board>.tar.xz
+
+Context: the rootfs running on the boards is mastered by the lead FPGA dev, NOT
+built from this repo. Until that image absorbs the meta-fau-modem layer, this
+tarball is the only delivery path, and it must be fully self-contained. That is
+why it ships all of GNU Radio, numpy, pyyaml, pyzmq, volk, spdlog, boost, etc.
+even though a rootfs built from THIS repo would already contain them.
+
+
+-------------------------------------------------------------------------------
+1. BEFORE THE FIRST xz DEPLOY: confirm the board can decompress it
+-------------------------------------------------------------------------------
+
+The scripts default to xz (COMPRESS=xz). busybox builds its xz and bzip2
+decompressor applets CONDITIONALLY, so a stock vendor image may have gunzip and
+nothing else. Run this ON THE BOARD once:
+
+    for c in xzcat unxz bunzip2 bzcat gunzip zcat; do
+        command -v "$c" >/dev/null && echo "$c ok"
+    done
+
+    # busybox may provide an applet without a symlink on PATH:
+    busybox --list | grep -E '^(xzcat|unxz|bunzip2|bzcat|gunzip|zcat)$'
+
+Interpretation:
+
+    xzcat or unxz present   -> keep the default. Best case, 13.5 MB.
+    only bunzip2/bzcat      -> re-run with COMPRESS=bzip2. 18.8 MB.
+    only gunzip/zcat        -> re-run with COMPRESS=gzip.  21.2 MB.
+
+Record the answer here once it is known, so nobody has to re-check:
+
+    board 7010 decompressors: ____________________  (date: __________)
+    board 7020 decompressors: ____________________  (date: __________)
+
+
+-------------------------------------------------------------------------------
+2. BUILD THE TARBALL (host)
+-------------------------------------------------------------------------------
+
+    cd scripts
+    ./extract_gnuradio.sh                  # xz, the default
+    COMPRESS=bzip2 ./extract_gnuradio.sh   # fallback
+    COMPRESS=gzip  ./extract_gnuradio.sh   # most conservative
+
+The script prints the size and the exact matching on-target extract command for
+whatever it just built. Use that line rather than reconstructing it by hand.
+
+Sizes measured on the real 58.8 MB uncompressed 7010 production payload:
+
+    compressor   tarball    vs gzip   host time   target decoder RAM
+    ----------   -------    -------   ---------   ------------------
+    xz -6 -T0    13.5 MB     -36%      8.4 s            9 MiB
+    xz -9        13.3 MB     -37%     21.0 s           65 MiB   (not used)
+    bzip2 -9     18.8 MB     -11%      4.4 s          small
+    gzip -9      21.2 MB      ----      5.5 s          small
+
+xz preset 6 rather than 9 is deliberate. Preset 9 saves another 190 KB but
+needs a 64 MiB dictionary allocation on the DECOMPRESSING side. On a 512 MB
+board with the top 32 MiB reserved for the DMA window that is a bad trade for
+1.4%. The ARM/ARM-Thumb BCJ filter would reach 13.1 MB, but busybox's
+XZ-Embedded decoder only handles BCJ filters if CONFIG_XZ_DEC_ARMTHUMB was
+enabled in that image, so it is not used either -- 1.3% is not worth a tarball
+the board might refuse to open.
+
+
+-------------------------------------------------------------------------------
+3. COPY TO THE BOARD
+-------------------------------------------------------------------------------
+
+    scp ~/gnuradio_headless_7010.tar.xz root@<board-ip>:/tmp/
+
+If scp is unavailable on the target's dropbear build, use the SD card or:
+
+    # on the host
+    nc -l -p 5555 < ~/gnuradio_headless_7010.tar.xz
+    # on the board
+    nc <host-ip> 5555 > /tmp/gnuradio_headless_7010.tar.xz
+
+Verify the transfer before extracting -- a truncated tarball fails deep into
+extraction with confusing per-file errors:
+
+    # host
+    md5sum ~/gnuradio_headless_7010.tar.xz
+    # board
+    md5sum /tmp/gnuradio_headless_7010.tar.xz
+
+
+-------------------------------------------------------------------------------
+4. EXTRACT ON THE BOARD
+-------------------------------------------------------------------------------
+
+Use the explicit pipe form. Do NOT use `tar -xJf`: busybox tar's seamless-xz
+autodetect (FEATURE_SEAMLESS_XZ) is a separate build-time option from the xzcat
+applet, so `-J` can fail on an image where `xzcat` works fine.
+
+    cd /
+    xzcat  /tmp/gnuradio_headless_7010.tar.xz | tar -xf - -C /      # COMPRESS=xz
+    bzcat  /tmp/gnuradio_headless_7010.tar.bz2 | tar -xf - -C /     # COMPRESS=bzip2
+    zcat   /tmp/gnuradio_headless_7010.tar.gz  | tar -xf - -C /     # COMPRESS=gzip
+
+If only `unxz` exists and not `xzcat`:
+
+    unxz -c /tmp/gnuradio_headless_7010.tar.xz | tar -xf - -C /
+
+Notes:
+
+  - Must run as root: the payload lands in /usr/lib and /usr/share.
+  - Everything is under a single top-level `usr/` prefix, so `-C /` is correct
+    and the tarball will not scatter files outside /usr.
+  - xz decode on the Cortex-A9 runs roughly 4-6 MB/s, so expect ~10-15 s for
+    the 58.8 MB payload versus ~5 s for gzip. Slower to extract, much faster to
+    transfer. This is a one-time cost per deploy.
+  - Extracting to a tmpfs /tmp first requires ~59 MB free there. Prefer piping
+    straight to / as above, which never materialises the uncompressed tar.
+
+To preview without writing anything:
+
+    xzcat /tmp/gnuradio_headless_7010.tar.xz | tar -tvf - | head -40
+
+
+-------------------------------------------------------------------------------
+5. VERIFY ON THE BOARD
+-------------------------------------------------------------------------------
+
+The host-side scripts run a readelf dependency-closure check and a Python
+import advisory, but neither can prove the payload loads against the lead's
+rootfs -- different glibc, libstdc++ or Python minor version will only surface
+here. This import test is the real acceptance gate:
+
+    python3 -c "from gnuradio import gr; print(gr.version())"
+    python3 -c "from gnuradio import blocks, digital, filter, fft, analog"
+    python3 -c "from gnuradio import fau_modem; print(fau_modem.__file__)"
+
+The payload is built for CPython 3.12 (cpython-312 ABI tags). Confirm the
+target agrees, or every binding import fails with ModuleNotFoundError:
+
+    python3 -V        # must be 3.12.x
+
+Check for unresolved shared libraries -- the failure mode is
+"libX.so.N: cannot open shared object file" at import:
+
+    ldd /usr/lib/libgnuradio-runtime.so.* | grep -i "not found"
+    ldd /usr/lib/python3.12/site-packages/gnuradio/fau_modem/*.so | grep -i "not found"
+
+Confirm the modem blocks specifically -- these six files are the whole point of
+the tarball (about 171 KB of the payload):
+
+    ls -l /usr/lib/libgnuradio-fau_modem.so.1.0.0*
+    ls -l /usr/lib/python3.12/site-packages/gnuradio/fau_modem/
+    ls -l /usr/share/gnuradio/grc/blocks/fau_modem_fau_{source,sink}.block.yml
+
+If ldd reports a missing boost library, note that all seven shipped boost libs
+are genuinely required by the payload's own binaries (filesystem, log,
+log_setup, serialization, wserialization, thread, program_options) -- do not
+trim the DEPLIBS list in the extract scripts to "save space".
+
+
+-------------------------------------------------------------------------------
+6. AFTER THE LEAD MERGES THE IMAGE
+-------------------------------------------------------------------------------
+
+Once the boards boot a rootfs built from this repo, nearly all of this becomes
+redundant: that image already carries every gnuradio-* subpackage, numpy,
+pyyaml, pyzmq, volk, spdlog and gr-fau-modem itself via IMAGE_INSTALL. At that
+point the useful delivery unit shrinks to just the modem blocks (~171 KB, about
+40 KB gzipped) and compressor choice stops mattering. Revisit this document
+then rather than continuing to push 13-21 MB per iteration.
