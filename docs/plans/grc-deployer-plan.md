@@ -1,5 +1,94 @@
 # Plan: FAU GRC Deployer (desktop → board over UART)
 
+Status: **transport-only V1 slice implemented and tested (2026-08-31), not
+yet run against real hardware.** Everything below this line is the original
+design record; see the "Implementation status" section immediately below for
+what actually exists in `scripts/fau_deployer/` today and how it deviates
+from (or confirms) this doc. Companion to the root `CLAUDE.md` (which covers
+the blocks/PetaLinux side); this doc covers the **desktop-side deployment
+tooling**.
+
+## Implementation status (2026-08-31)
+
+Scope actually built: **robust transport of a generated flowgraph (+ its
+local sibling imports) from desktop to board over the serial console** --
+payload assembly, the wire protocol, login/prompt state machine, chunked
+send with retransmit, the board-side receiver, and self-healing bootstrap.
+Deliberately NOT built in this pass: running the flowgraph on the board /
+Ctrl-C teardown, the desktop no-op shim blocks, `.grc` preflight gates and
+the headless transform, GUI mode, board-block enumeration (Gate 2), serial
+auto-detect. `cli.py` has no `--grcc`/`.grc` front-end yet either; input is
+a `.py` file today.
+
+Layout: `scripts/fau_deployer/{cli.py, core/{report,protocol,payload,
+transport,session,bootstrap,sender}.py, board/receiver.py, tests/}`. 69
+tests (stdlib `unittest`, no pytest on this machine), all green, including a
+real pty + real receiver subprocess (`tests/fake_board.py`), a real
+forkpty'd shell for the login state machine (`tests/fake_shell.py` +
+`tests/shell_stub.py`), and fault injection (`tests/lossy.py`: bit flips,
+dropped lines, kernel-printk noise, simulated reboot) proving the
+retransmit path actually recovers rather than being untested dead code.
+Run: `python3 -m unittest discover -s scripts/fau_deployer/tests -p
+'test_*.py' -t .` from the repo root.
+
+Deltas from the design below (all found by actually building and testing
+against a real pty, not just reasoning about it):
+
+- **Per-chunk CRC32 is mandatory**, not left as an open question -- without
+  it a bit flip landing inside the base64 alphabet decodes cleanly, gets
+  ACKed, and is only caught by the end-of-transfer sha256, forcing exactly
+  the full re-send chunking exists to avoid.
+- **V1 ships stop-and-wait (`--window 1` behavior) only.** The credit-window
+  optimization discussed below is deferred; the retransmit loop is written
+  to support a window but nothing yet drives it above 1.
+- **The bootstrap push needed a way to tell a stale receiver to stop.** It
+  deliberately clears `ISIG` in raw mode, so Ctrl-C is just a data byte, not
+  a signal -- added `ShutdownRequested` in `receiver.py` (0x03 anywhere in
+  the input stream means "exit cleanly"), which the bootstrap logic in
+  `core/bootstrap.py` relies on to retire a stale copy before repushing.
+- **Payload input is multi-file by default, not an afterthought** --
+  `core/payload.py` walks the flowgraph's imports with `ast` and recursively
+  collects local sibling modules (confirmed against the repo's own
+  `examples/tx_sine.py` -> `fau_tx_common.py`), since a flowgraph shipped
+  alone would transfer successfully and then fail with `ImportError` on the
+  board, which is a worse failure than a slow one.
+- **`LineReader` (core/transport.py) had three real bugs**, all caught by
+  tests against a real pty rather than by inspection: (1) `wait_for()`
+  checked the whole buffer for a match before draining complete lines,
+  so a multi-line burst arriving in one read returned everything instead of
+  just the match and skipped the `on_line` callback for earlier lines; (2)
+  a matched *unterminated* tail (a bash prompt has no trailing `\n`) was
+  returned but never removed from the buffer, so it got prepended to
+  whatever arrived on the *next* call -- this broke every second command
+  against the same session; (3) `BoardSession._probe()`'s classification
+  had the same "tail read but not consumed" bug via `collect_for()`. All
+  three are fixed and covered by regression tests in `test_transport.py`.
+- **`_probe()` cannot blindly send `\r` to elicit a response.** That's safe
+  at a shell prompt (redraws it) but not at a fresh `login:` prompt, where
+  it submits a blank username -- the fix reads passively first and only
+  falls back to sending `\r` if nothing is pending.
+- **A race in the stale-receiver retirement path**: sending `0x03` and
+  immediately issuing the next shell command risked the still-dying
+  receiver reading those bytes as protocol noise and discarding them before
+  it exited -- they'd never reach the shell at all. Fixed by waiting for the
+  shell's PS1 marker to reactually reappear before proceeding.
+- **`_do_password()`'s fixed 8-second wait was a real (if non-fatal)
+  performance bug** -- `collect_for()` always blocks for its whole window;
+  added `collect_until(predicate, timeout)` for early-exit waits where more
+  than one condition (rejection message vs. prompt) can end the wait.
+- **`os.forkpty()`, not `pty.openpty()` + `subprocess.Popen(stdin=slave_fd,
+  ...)`**, for the test harness (`tests/fake_board.py`, `tests/fake_shell.py`).
+  The latter only dup2's an already-open fd onto the child's stdio, which
+  never establishes the pty as that process's *controlling* terminal
+  (needs `setsid()` + `TIOCSCTTY`, which only `forkpty()`/`pty.fork()` do
+  automatically) -- without it, `Ctrl-C` never generates a real `SIGINT`,
+  which matters for the orphan-recovery test (`tests/shell_stub.py`'s
+  `mode_orphan` forks a child that a real SIGINT can kill, mirroring how a
+  real shell survives Ctrl-C while its foreground child doesn't).
+
+Original status line below ("design agreed, not yet implemented") is
+superseded by the above; kept for history.
+
 Status: **design agreed, not yet implemented.** Discussion-only so far; no code
 written. This file is the durable record of the design so it can be picked up
 later. Companion to the root `CLAUDE.md` (which covers the blocks/PetaLinux
@@ -25,11 +114,34 @@ them is what makes the design fall out:
 | **3. *Execute*** the flowgraph | real `fau_modem` module + `/dev/mem` + bitstream | **Board only** — ctor opens `/dev/mem` in the member-init list, so it can't even be *constructed* off-board |
 
 "Build on desktop, export to board" = **author+generate on desktop, deploy+run
-on board.** Execution can never happen on the desktop for these blocks as
-written (confirmed: `fau_source_impl` members `d_window`/`d_dma` open
-`/dev/mem` in the ctor init list → `hw/mmio.cc:27`). Desktop simulation is
-explicitly out of scope (would require moving the hardware open out of the
-ctor into `start()` + a null-hardware backend — not wanted).
+on board.** Real DMA execution can never happen on the desktop for these
+blocks as written (confirmed: `fau_source_impl` members `d_window`/`d_dma`
+open `/dev/mem` in the ctor init list → `hw/mmio.cc:27`).
+
+**Revised 2026-08-31 (supersedes the original "desktop simulation explicitly
+out of scope" call above):** a desktop build variant of `fau_source`/
+`fau_sink` is now in scope, decided as **no-op pass-through**, not the
+rejected null-hardware backend and not a construct-only stub:
+
+- Desktop ctor does **not** open `/dev/mem` — parameters/wiring configure
+  freely with no hardware probing.
+- `start()` succeeds on desktop (unlike the "refuse cleanly at start()"
+  alternative that was considered and passed over).
+- `work()` is genuinely no-op: `fau_source` emits zeros/silence, `fau_sink`
+  discards — no fake DMA ring, no simulated register/timing behavior. This
+  lets a flowgraph run structurally on desktop (wiring/rate/type checks)
+  without pretending to model the real hardware.
+- Needs a real desktop build target for `gr-fau_modem` (host toolchain, no
+  ARM sysroot) with a backend switch between the real `hw::` path and this
+  no-op path — implementation TBD when this work item is picked up.
+
+**Future idea, not yet scoped for V1:** a whitelist of source/sink blocks
+allowed to "stick around" when deploying to the board — in practice only
+software sources/sinks (`fau_source`/`fau_sink`, file/vector/null blocks,
+etc.); any other SDR-hardware source/sink (UHD, RTL-SDR, etc.) would need to
+be disabled and stripped from the flowgraph before deploy, the same way GUI
+blocks are stripped in the headless transform below. Likely belongs as a new
+preflight gate alongside Gate 1/2, not yet designed.
 
 ## Phase 1 — blocks in desktop GRC (trivial, prerequisite)
 
