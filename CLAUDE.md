@@ -439,6 +439,79 @@ repeat=True)` is already streaming. `modem_reference`'s `wav_tx.py` frames +
 BPSK-modulates above the DMA layer, which stays out of scope (see the last
 section).
 
+## VOLK's "Ranking <kernel>" spam is a stray debug print, not profiling (2026-09-03)
+
+Every flowgraph start on the boards printed pages of
+
+    Ranking volk_32f_s32f_convert_16i
+    Ranking volk_32f_s32f_convert_16i
+
+**This is not evidence that VOLK is benchmarking at runtime, and shipping a
+pre-baked `volk_config` does not stop it.** Do not go looking for a profiling
+step to disable — there isn't one.
+
+`lib/volk_rank_archs.c` in VOLK 3.2.0 (`SRCREV = a47ac72163`, pinned by
+`meta-sdr/recipes-support/volk/volk_git.bb`):
+
+```c
+int volk_rank_archs(...)
+{
+    fprintf(stderr, "Ranking %s\n", kern_name);   /* first statement */
+```
+
+Unconditional, and ahead of the `volk_load_preferences()` call, so it fires with
+or without a config. The function it heads does **no timing whatsoever**: it
+loads `volk_config` once into a static, looks the kernel up by name, and on a
+miss picks the implementation with the largest `impl_deps` mask. Two calls per
+kernel — aligned and unaligned, hence the doubled lines — once per process, on
+first use. Cost is microseconds; the only real problem is that it buries genuine
+GNU Radio warnings.
+
+Upstream origin is `f8d244f` ("Ranking: Fail in a sensible manner, print useful
+info", Apr 2026), and the line is still present at the pinned SRCREV, which is
+also the tip of the local mirror under
+`build_7010/.../downloads/git2/github.com.gnuradio.volk.git`. Bumping SRCREV is
+therefore not known to help.
+
+**Fix shipped:** `meta-fau-modem/recipes-support/volk/volk_%.bbappend` plus
+`files/0001-Gate-the-per-kernel-Ranking-print-behind-VOLK_RANK_DEBUG.patch`,
+which gates the print behind a `VOLK_RANK_DEBUG` environment variable rather
+than deleting it — the diagnostic stays reachable (`VOLK_RANK_DEBUG=1 python3
+flowgraph.py`) and the function already consults `VOLK_GENERIC` and the
+per-kernel override variables, so a third `getenv` is idiomatic there. It lives
+in `meta-fau-modem` because that layer is `CONFIG_USER_LAYER_1` on **both**
+boards (see item 4 below), so one copy covers 7010 and 7020.
+
+Verified: applies clean to a pristine checkout at `a47ac72163` under both
+`git apply --check` and `patch -p1` (OE may use either PATCHTOOL), and the
+result compiles with the real `arm-xilinx-linux-gnueabi-gcc` 13.3.0 at
+`-mthumb -mfpu=neon -mfloat-abi=hard -mcpu=cortex-a9`. **`petalinux-build -c
+volk` has NOT been run** — `bblayers.conf` holds absolute paths into the main
+checkout, so a build only exercises this once the branch is merged there.
+
+Drop the bbappend when meta-sdr's SRCREV moves past an upstream fix; `do_patch`
+fails loudly if the context stops matching, so it cannot rot silently.
+
+### Separately: pinning the best implementations
+
+Orthogonal to the noise, and optional. `volk_profile` already ships on the
+boards (`/usr/bin/volk_profile` is in the volk RPM and `extract_one_pkg` unpacks
+the whole RPM). Lookup order in `volk_prefs.c` is
+`$VOLK_CONFIGPATH/volk/volk_config` → `$HOME/.volk/volk_config` →
+`/etc/volk/volk_config`. **Under `sudo` `HOME` is root's**, which is the usual
+reason a config written as the login user appears to be ignored.
+
+    sudo volk_profile -R 32f_s32f_convert_16i -R 16i_s32f_convert_32f -p /etc/volk
+
+`-R` is a repeatable substring filter (a full run on a Cortex-A9 is very slow)
+and `-p` creates the directory itself. `volk_git.bb` already has the hook to
+bake a config into the image for a given machine —
+`SRC_URI:append:<machine> = "file://volk_config"` plus the existing
+`do_install:append`, which installs to `${ROOT_HOME}/.volk`. Expected payoff is
+modest: the no-config fallback already picks max-dep-mask, i.e. NEON on this
+target, so profiling only helps for the kernels where NEON is actually slower
+than generic.
+
 ## What's left, in order
 
 ### 1. Bring-up tests on hardware (before trusting the blocks at all)
@@ -559,19 +632,23 @@ regenerated device tree picks it up in the same pass. Do **not**
 is unset on both boards, so the PL loads from `BOOT.BIN` via FSBL — a stale
 `BOOT.BIN` on the SD card is the most likely way this silently doesn't take.
 
-### 4. Fix the 7020 layer gap
+### 4. Fix the 7020 layer gap — RESOLVED (verified 2026-09-03)
 
-Confirmed again this session: `build_7020/petalinux_7020_os/build/conf/bblayers.conf`
-does not include `meta-fau-modem` (7010's does), even though 7020's
-`petalinuxbsp.conf` already has `IMAGE_INSTALL:append = " gr-fau-modem"`.
-This is exactly why `extract_gnuradio.sh` correctly failed to find
-`gr-fau-modem` for board 7020 this session.
+**Done.** Both boards now carry, in
+`build_<board>/petalinux_<board>_os/project-spec/configs/config`:
 
-Fix: `build_7020/petalinux_7020_os/project-spec/configs/config`, set
-`CONFIG_USER_LAYER_1` to the absolute path of `components/layers/meta-fau-modem`
-(mirroring 7010's config), then `petalinux-config --silentconfig` to
-regenerate `bblayers.conf` (don't hand-edit it, it's regenerated on every
-configure).
+    CONFIG_USER_LAYER_0=".../components/layers/meta-sdr"
+    CONFIG_USER_LAYER_1=".../components/layers/meta-fau-modem"
+
+and both generated `build/conf/bblayers.conf` files list `meta-fau-modem`.
+Checked the `configs/config` source of truth, not just the generated
+`bblayers.conf` — the latter is regenerated on every `petalinux-config`, so a
+correct `bblayers.conf` with an empty `CONFIG_USER_LAYER_1` would silently
+revert. It does not; both are set.
+
+**Consequence worth knowing:** anything placed in `meta-fau-modem` now reaches
+both boards from a single copy. That is why the volk bbappend below lives there
+rather than being duplicated into each project's `meta-user`.
 
 ### 5. RX gain (explicitly deferred this session, not started)
 
