@@ -83,12 +83,30 @@ def main():
     # ---- level and clipping -------------------------------------------
     sat = np.count_nonzero(np.abs(raw) >= 32767)
     frac = sat / (2.0 * n)
-    print("rms              %.4f full-scale" % np.sqrt(np.mean(np.abs(x) ** 2)))
-    print("peak             %.4f full-scale" % np.max(np.abs(x)))
+    rms = float(np.sqrt(np.mean(np.abs(x) ** 2)))
+    peak = float(np.max(np.abs(x)))
+    print("rms              %.4f full-scale (%.1f dBFS)"
+          % (rms, 20 * math.log10(max(rms, 1e-12))))
+    print("peak             %.4f full-scale (%.1f dBFS)"
+          % (peak, 20 * math.log10(max(peak, 1e-12))))
     print("saturated        %d components (%.3g)%s"
           % (sat, frac, "   <-- CLIPPING" if frac > args.clip_warn else ""))
     dc = np.mean(x)
     print("dc offset        %.5f  (|.| = %.5f)" % (dc.real, abs(dc)))
+
+    # An under-driven front end is the likeliest reason a capture "looks like
+    # noise": the floor is not raised, the signal is simply down in it. The
+    # AD9244 is 14-bit, so peak 0.01 full-scale is ~7 bits of the converter
+    # actually in use and ~40 dB of dynamic range thrown away. Say so loudly,
+    # because every downstream verdict in this script degrades with it.
+    if peak < 0.05:
+        print("                 ^^ UNDER-DRIVEN: only ~%.0f of 14 bits in use."
+              % max(1.0, math.log2(max(peak, 1e-9) * (1 << 13))))
+        print("                    Raise the AD8334 VGA gain "
+              "(gain-control/dac7512.py --vga-gain-volts) until peak is "
+              "0.3-0.5,")
+        print("                    then re-run. Judge nothing else about this "
+              "capture until you have.")
 
     # ---- where is the tone --------------------------------------------
     nfft = 1 << int(math.floor(math.log2(min(n, 1 << 20))))
@@ -116,7 +134,10 @@ def main():
     sig = np.sum(spec[band] ** 2)
     tot = np.sum(spec ** 2)
     noise = max(tot - sig, 1e-30)
-    print("tone / rest      %.1f dB" % (10 * np.log10(sig / noise)))
+    tone_db = float(10 * np.log10(sig / noise))
+    print("tone / rest      %.1f dB%s"
+          % (tone_db, "   (no dominant CW component -- chirp, modulation or "
+                      "noise)" if tone_db < 10.0 else ""))
 
     # ---- BD boundary continuity ---------------------------------------
     # Compare the sample-to-sample jump AT each BD boundary against the jumps
@@ -165,7 +186,16 @@ def main():
     # side are both valid, just not adjacent -- so the step check can miss it
     # entirely. It does shift the tone's phase by a fixed amount at that one
     # boundary, so track the per-BD phase of the tone and look for a jump.
-    if abs(peak_hz) > 1.0:
+    #
+    # ONLY VALID FOR A STATIONARY TONE. It de-rotates by ONE frequency, so any
+    # signal whose frequency moves -- a chirp above all -- produces large
+    # per-BD phase steps that mean nothing at all. Ran this against a chirp
+    # capture once and it reported 3.1 rad and "BROKEN" on a stream the step
+    # check had just certified clean. Gate it on there actually being a
+    # dominant CW component rather than merely an argmax bin, which every
+    # spectrum has.
+    tone_dominant = tone_db >= 10.0
+    if abs(peak_hz) > 1.0 and tone_dominant:
         ref = np.exp(-2j * math.pi * peak_hz * np.arange(n) / args.samp_rate)
         y = x * ref
         ph = [cmath.phase(np.sum(y[i * args.bd_samples:(i + 1) * args.bd_samples]))
@@ -177,20 +207,57 @@ def main():
         print("  phase check    max %.3f rad between adjacent BDs%s"
               % (pmax, "  <-- BROKEN, a slot was dropped or reordered"
                  if pbad else "   clean"))
+    elif not tone_dominant:
+        print("  phase check    skipped, no dominant CW tone (%.1f dB) -- "
+              "meaningless for a chirp or modulated signal" % tone_db)
     else:
-        print("  phase check    skipped, no tone to track "
-              "(pass --tone-rf and inject one)")
+        print("  phase check    skipped, tone sits at DC")
+
+    # ---- discontinuities ANYWHERE, not just at BD boundaries ----------
+    # The checks above only ever look at indices that are multiples of
+    # bd_samples, so they are blind to a glitch introduced anywhere else --
+    # downstream buffering, the file writer, or the analog side. Scan the
+    # whole record and report where the worst steps actually are, plus their
+    # offset within a BD: clustering at one offset means the ring, scattering
+    # means it is not the ring's fault.
+    outliers = np.flatnonzero(d > thresh)
+    print("\nGlitch scan      %d samples over the %.6f step threshold"
+          % (len(outliers), thresh))
+    if len(outliers):
+        failed = True
+        show = outliers[:8]
+        for i in show:
+            print("    sample %-9d t=%.4f s   step %.6f   offset %d/%d in BD"
+                  % (i, i / args.samp_rate, d[i],
+                     int(i % args.bd_samples), args.bd_samples))
+        if len(outliers) > len(show):
+            print("    ... and %d more" % (len(outliers) - len(show)))
+        aligned = int(np.count_nonzero(
+            (outliers % args.bd_samples) >= args.bd_samples - 1))
+        print("    %d of %d land on a BD boundary -> %s"
+              % (aligned, len(outliers),
+                 "ring/reclaim problem" if aligned > len(outliers) // 2
+                 else "NOT ring-aligned, look outside fau_source "
+                      "(downstream buffering, file writer, or analog)"))
 
     if failed:
-        print("  RESULT         DISCONTINUOUS -- the ring is splicing, "
-              "repeating or dropping slots.")
-        print("                 fau_source's own counters cannot see this: a "
-              "BD that retires with the")
-        print("                 right length and SOF/EOF is 'good' by every "
-              "test the block can make.")
+        print("\nRESULT           DISCONTINUOUS")
+        if bad or (len(outliers) and
+                   np.count_nonzero((outliers % args.bd_samples)
+                                    >= args.bd_samples - 1) > len(outliers) // 2):
+            print("                 Ring-aligned, so the reclaim path is "
+                  "splicing, repeating or dropping")
+            print("                 slots. fau_source's counters cannot see "
+                  "this: a BD that retires with the")
+            print("                 right length and SOF/EOF is 'good' by "
+                  "every test the block can make.")
+        else:
+            print("                 NOT ring-aligned -- this is not "
+                  "fau_source's descriptor handling.")
         return 1
 
-    print("  RESULT         continuous across every BD boundary")
+    print("\nRESULT           continuous -- no discontinuity at any BD "
+          "boundary or anywhere else")
     return 0
 
 
