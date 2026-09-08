@@ -346,6 +346,53 @@ than calling `work()` short), so the source never had this bug.
 
 **Never assume a sink's `work()` gets a full block. Accumulate.**
 
+### ROOT CAUSE (confirmed on hardware): fau_source's work() was never called
+
+The source-side twin of the bug above, found 2026-09-08. `fau_source` wrote a
+44-byte header-only WAV no matter how long the flowgraph ran.
+
+`set_output_multiple(bd_samples)` IS honoured for a source -- but honouring it
+means the scheduler refuses to call `work()` until it can offer a full
+`bd_samples`, and it never could. GNU Radio sizes an output buffer from a fixed
+byte count (`32768 * 2 / sizeof(gr_complex)` = 8192 items) and
+`min_available_space()` offers at most `round_down(bufsize / 2, output_multiple)`.
+At the default `bd_samples = 8192` that is `round_down(4096, 8192) == 0` ->
+BLKD_OUT on every pass, forever. (GR 3.10's `allocate_buffer` clamps `nitems` up
+to `2 * output_multiple`, which would have saved it; 3.11, which the boards run,
+does not. Another instance of "do not verify runtime behaviour against the 3.10
+tree in `build_*/`".)
+
+**Fix:** `set_min_output_buffer(4 * bd_samples)` in the constructor, next to
+`set_output_multiple`. It is mandatory, not tuning.
+
+**Why it took so long:** nothing inside the block can see this. `start()` arms
+cleanly, the S2MM engine fills all `num_bds - 1` descriptors and parks at Idle,
+every counter reads zero, and the stall watchdog stays silent because the
+watchdog lives inside `work()`. The block cannot report that it is not being
+run. Three hypotheses died first -- wrong bitstream, tail-bump SG mode, and the
+flowgraph being stopped too early -- and all three were only killed by evidence
+from *outside* the block:
+
+- `devmem` on `0x40400004`/`0x40400034` (MM2S/S2MM `DMASR`) identifies the
+  loaded bitstream with a read that is safe on every design, because the AXI
+  DMA's AXI-Lite slave is always instantiated. Use this, not a GPIO probe.
+- `devmem` on the live DMA showed `DMASR=0x0001100A` (Idle+IOC), `CURDESC ==
+  TAILDESC == BD14`: the hardware had completed all 15 BDs. That killed
+  tail-bump, which CLAUDE.md had flagged as the riskiest assumption -- it works.
+- A 40 s run with `poll_timeout=20` producing no stall FATAL proved `work()`
+  was never entered, since every `WORK_DONE` path prints to stderr.
+
+**When a block reports nothing, the next measurement has to come from outside
+it.** Registers via `devmem`, or the reference driver, not another counter.
+
+### Confirmed working on hardware (2026-09-08)
+
+`fau_source` -> `complex_to_float` -> `wavfile_sink`, S10 board with
+`S10_adc.bit.bin`, 200 kSPS, NCO 100 kHz, `bd_samples=8192`, `num_bds=16`:
+8.7 MB captured in ~15 s, `overruns=0 malformed=0`. The reference
+(`dma_rx_sg_16m.program_s2mm_capture`) captures identically on the same board,
+6/6 BDs SOF+EOF, and remains the cross-check when something regresses.
+
 ### Process lessons from this bug
 
 What resolved it was instrumentation, not analysis. Splitting `bds_moved()`
