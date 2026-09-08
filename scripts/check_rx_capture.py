@@ -240,6 +240,63 @@ def main():
                  else "NOT ring-aligned, look outside fau_source "
                       "(downstream buffering, file writer, or analog)"))
 
+    # ---- additive bursts ----------------------------------------------
+    # The checks above look for DISCONTINUITIES -- a jump between adjacent
+    # samples. They are blind to an additive broadband burst, which is what
+    # actually shows up as a horizontal streak across a waterfall: it raises
+    # the power for a moment without stepping the waveform, and after the CIC
+    # and FIR its slew is bounded by the passband anyway.
+    #
+    # Short-time power, robust outlier detection, and above all the PERIOD of
+    # whatever is found -- because the period is what names the culprit.
+    w = 512
+    nw = len(x) // w
+    if nw >= 16:
+        pw = np.sum(np.abs(x[:nw * w].reshape(nw, w)) ** 2, axis=1) / w
+        med = float(np.median(pw))
+        # median absolute deviation: immune to the bursts themselves
+        mad = float(np.median(np.abs(pw - med))) or 1e-30
+        z = (pw - med) / (1.4826 * mad)
+        hits = np.flatnonzero(z > 8.0)
+        print("\nBurst scan       window %d samples (%.2f ms), %d windows"
+              % (w, 1e3 * w / args.samp_rate, nw))
+        print("  median power   %.3e   burst threshold %.3e"
+              % (med, med + 8.0 * 1.4826 * mad))
+        if len(hits) == 0:
+            print("  RESULT         no impulsive bursts")
+        else:
+            print("  bursts         %d windows (%.2f%% of the record), "
+                  "peak %.1f dB over median"
+                  % (len(hits), 100.0 * len(hits) / nw,
+                     10 * math.log10(float(np.max(pw[hits])) / med)))
+            # Group adjacent windows into single events, then time them.
+            ev = [hits[0]]
+            for a, b in zip(hits, hits[1:]):
+                if b - a > 1:
+                    ev.append(b)
+            ev = np.array(ev)
+            print("  events         %d" % len(ev))
+            if len(ev) >= 3:
+                gap = np.diff(ev) * w
+                gmed = float(np.median(gap))
+                jit = float(np.std(gap))
+                print("  period         %.1f ms median (%.1f Hz), "
+                      "jitter %.1f ms"
+                      % (1e3 * gmed / args.samp_rate,
+                         args.samp_rate / gmed if gmed else 0.0,
+                         1e3 * jit / args.samp_rate))
+                in_bds = gmed / args.bd_samples
+                near = abs(in_bds - round(in_bds))
+                print("  vs BD period   %.2f BDs%s" % (in_bds,
+                      "  <-- integer multiple, so it tracks the ring"
+                      if near < 0.08 and in_bds >= 0.92
+                      else "  (not a whole number of BDs -- unrelated to the "
+                           "descriptor ring)"))
+            print("  NOTE           bursts are additive energy, NOT a broken "
+                  "stream. The step and glitch")
+            print("                 checks above cover the ring; this does "
+                  "not. Chase it by period.")
+
     if failed:
         print("\nRESULT           DISCONTINUOUS")
         if bad or (len(outliers) and
