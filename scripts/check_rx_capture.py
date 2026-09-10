@@ -174,9 +174,18 @@ def main():
             print("                 WARNING: part of the sweep is outside "
                   "+/-%.0f kHz and will alias"
                   % (args.samp_rate / 2e3))
-        if want_lo < 0 < want_hi:
-            print("                 NOTE: the sweep crosses DC, so its lower "
-                  "half folds onto its upper half")
+        # Crossing DC is FINE here and putting the NCO at the sweep centre is
+        # the right choice: this is complex I/Q baseband, where -f and +f are
+        # distinct and both representable within +/-samp_rate/2. (An earlier
+        # version warned about the lower half "folding onto" the upper half.
+        # That is true of REAL sampling only, and it was wrong.) What does
+        # deserve a mention is that DC offset and the I/Q-imbalance mirror now
+        # sit inside the occupied band instead of off to one side -- and only
+        # when they are actually large enough to matter.
+        if want_lo < 0 < want_hi and abs(dc) > 0.02 * rms:
+            print("                 NOTE: the sweep spans DC, so the %.1f dB "
+                  "dc offset sits inside the signal band"
+                  % (20 * math.log10(max(abs(dc), 1e-12) / max(rms, 1e-12))))
 
     tone_db = float(10 * np.log10(sig / noise))
     print("tone / rest      %.1f dB%s"

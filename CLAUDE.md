@@ -385,13 +385,62 @@ from *outside* the block:
 **When a block reports nothing, the next measurement has to come from outside
 it.** Registers via `devmem`, or the reference driver, not another counter.
 
-### Confirmed working on hardware (2026-09-08)
+### Confirmed working on hardware, against a real SDR signal (2026-09-10)
 
 `fau_source` -> `complex_to_float` -> `wavfile_sink`, S10 board with
-`S10_adc.bit.bin`, 200 kSPS, NCO 100 kHz, `bd_samples=8192`, `num_bds=16`:
-8.7 MB captured in ~15 s, `overruns=0 malformed=0`. The reference
+`S10_adc.bit.bin`, 200 kSPS, NCO 120 kHz, `bd_samples=8192`, `num_bds=16`.
+Signal: USRP N210 transmitting a linear chirp, 30 kHz wide centred on 120 kHz
+(105-135 kHz).
+
+    occupied band    -14.0 .. +13.2 kHz baseband (90% of power, 27.2 kHz wide)
+                     = 106.0 .. 133.2 kHz absolute
+    in-band / out    46.8 dB (100.0% of total power in band)
+    step check       clean (156 BD boundaries)
+    glitch scan      0 samples over threshold
+    burst scan       no impulsive bursts
+                     overruns=0 malformed=0
+
+Verified with `scripts/check_rx_capture.py`. A VGA gain sweep (0.0-0.9 V via
+`gain-control/dac7512.py`) produced five independent captures, all continuous,
+~760 BD boundaries total. The reference driver
 (`dma_rx_sg_16m.program_s2mm_capture`) captures identically on the same board,
 6/6 BDs SOF+EOF, and remains the cross-check when something regresses.
+
+**Known remaining issue, analog not digital:** the RX front end compresses
+above VGAIN ~0.5 V -- +19 dB of gain from 0.0 to 0.5 V, then +0.7 dB across
+the next 0.4 V, plateauing at 8.7% of ADC full scale (-21 dBFS) with zero
+saturated samples. Something limits ahead of the converter and it costs ~20 dB
+of dynamic range. Not a `fau_source` problem.
+
+### Verifying a capture: use numbers, not the waterfall
+
+`scripts/check_rx_capture.py` exists because reading a spectrum display cost
+several rounds of wrong conclusions in a row, in both directions:
+
+- A static CW tone **passed** a capture that a chirp later showed was noisy.
+  A tone integrates into one FFT bin and survives a terrible SNR; a chirp
+  spreads its energy and does not. Never accept a CW tone as the acceptance
+  test.
+- A chirp capture was read as "no signal" because `tone / rest` was -34 dB and
+  the FFT argmax wandered between runs. That is exactly what a 30 kHz chirp
+  looks like. Use the **occupied band** (90%-power span) for anything
+  wideband, never the peak bin.
+- Waterfall streaks were read as ring discontinuities while the step check
+  said clean and `overruns` read 0. All three were correct: the streaks were
+  a signal 20 dB below where it should have been, being stretched by the
+  display.
+- A "stale file" verdict was really the flowgraph silently failing to rewrite
+  the wav. `scripts/../fau_vgain_sweep.sh` (kept out of tree; see git history)
+  deletes the wav before every run and prints size + md5 per row so this
+  cannot recur.
+
+The script separates the phenomena that look alike: **step/glitch checks**
+find discontinuities (splices, dropped slots), the **burst scan** finds
+additive impulsive energy and reports its period (a whole number of BDs
+implicates the ring; anything else does not), and **occupied band /
+in-band ratio** answers whether the signal is where the frequency plan says.
+The phase check is CW-only and is gated on a dominant tone -- it is
+meaningless for a chirp.
 
 ### Process lessons from this bug
 
