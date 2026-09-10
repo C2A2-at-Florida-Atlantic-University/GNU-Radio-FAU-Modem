@@ -59,6 +59,13 @@ def main():
     p.add_argument("--tone-rf", type=float, default=None,
                    help="frequency of the injected tone, Hz. Expected "
                         "baseband offset is tone_rf - nco.")
+    p.add_argument("--chirp-center", type=float, default=None,
+                   help="centre frequency of an injected chirp, Hz (RF, same "
+                        "reference as --nco). Use with --chirp-bw.")
+    p.add_argument("--chirp-bw", type=float, default=None,
+                   help="chirp bandwidth in Hz. With --chirp-center this "
+                        "checks how much energy actually lands in the band "
+                        "the sweep is supposed to occupy.")
     p.add_argument("--bd-samples", type=int, default=8192,
                    help="must match the block's bd_samples")
     p.add_argument("--clip-warn", type=float, default=1e-4,
@@ -134,6 +141,43 @@ def main():
     sig = np.sum(spec[band] ** 2)
     tot = np.sum(spec ** 2)
     noise = max(tot - sig, 1e-30)
+    # ---- where does the energy ACTUALLY sit -----------------------------
+    # For anything wideband -- a chirp above all -- the argmax bin is
+    # meaningless and wanders run to run. What answers "is my signal there?"
+    # is the occupied band: the narrowest contiguous span holding most of the
+    # power. Report it unconditionally, because reading it off a waterfall
+    # screenshot is exactly how a frequency-plan error survives for hours.
+    psd = spec ** 2
+    order = np.argsort(psd)[::-1]
+    csum = np.cumsum(psd[order])
+    keep = order[:1 + int(np.searchsorted(csum, 0.9 * csum[-1]))]
+    occ_lo, occ_hi = float(np.min(freqs[keep])), float(np.max(freqs[keep]))
+    print("occupied band    %+.1f .. %+.1f kHz baseband (90%% of power, "
+          "%.1f kHz wide)"
+          % (occ_lo / 1e3, occ_hi / 1e3, (occ_hi - occ_lo) / 1e3))
+    print("                 = %.1f .. %.1f kHz absolute"
+          % ((args.nco + occ_lo) / 1e3, (args.nco + occ_hi) / 1e3))
+
+    if args.chirp_center is not None and args.chirp_bw is not None:
+        want_lo = args.chirp_center - args.chirp_bw / 2.0 - args.nco
+        want_hi = args.chirp_center + args.chirp_bw / 2.0 - args.nco
+        inb = (freqs >= want_lo) & (freqs <= want_hi)
+        pin = float(np.sum(psd[inb]))
+        pout = float(np.sum(psd[~inb])) or 1e-30
+        print("expected band    %+.1f .. %+.1f kHz baseband"
+              % (want_lo / 1e3, want_hi / 1e3))
+        print("in-band / out    %.1f dB (%.1f%% of total power in band)"
+              % (10 * math.log10(pin / pout),
+                 100.0 * pin / (pin + pout)))
+        if min(abs(want_lo), abs(want_hi)) < args.samp_rate / 2 \
+                and max(abs(want_lo), abs(want_hi)) > args.samp_rate / 2:
+            print("                 WARNING: part of the sweep is outside "
+                  "+/-%.0f kHz and will alias"
+                  % (args.samp_rate / 2e3))
+        if want_lo < 0 < want_hi:
+            print("                 NOTE: the sweep crosses DC, so its lower "
+                  "half folds onto its upper half")
+
     tone_db = float(10 * np.log10(sig / noise))
     print("tone / rest      %.1f dB%s"
           % (tone_db, "   (no dominant CW component -- chirp, modulation or "
