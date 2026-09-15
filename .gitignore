@@ -11,3 +11,7 @@
 !**/system-user.dtsi
 
 modem_reference
+# Python bytecode -- these were tracked by accident; they churn on every
+# test run and nothing needs them in the history.
+__pycache__/
+*.pyc

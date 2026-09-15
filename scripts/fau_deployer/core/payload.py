@@ -68,13 +68,20 @@ def _local_import_names(path):
     return names
 
 
-def collect_files(main, extra=(), max_bytes=MAX_BYTES_DEFAULT):
+def collect_files(main, extra=(), max_bytes=MAX_BYTES_DEFAULT,
+                  search_dirs=()):
     """Resolve `main` (the flowgraph to run) plus every local sibling module
     it imports, transitively, plus any `extra` paths named explicitly.
 
     Returns an ordered list of (Path, arcname) tuples, `main` first. Raises
     PayloadError on a directory, a symlink, a duplicate arcname pointing at
     two different files, or a total size over `max_bytes`.
+
+    `search_dirs` are extra directories to look for those siblings in,
+    searched after `main`'s own. The Process phase needs this: a generated
+    flowgraph lands in a build directory, but the `fau_tx_common.py` it
+    imports still sits beside the `.grc` it came from, so "sibling" has to
+    mean sibling of the *source* as well as of the generated file.
     """
     main_path = Path(main)
     if not main_path.is_file():
@@ -83,6 +90,13 @@ def collect_files(main, extra=(), max_bytes=MAX_BYTES_DEFAULT):
         raise PayloadError("--flowgraph %s: refusing to follow a symlink" % main)
 
     src_dir = main_path.resolve().parent
+    # Ordered, de-duplicated: main's own directory first, so a module that
+    # exists in both wins where the flowgraph itself lives.
+    lookup_dirs = [src_dir]
+    for d in search_dirs:
+        resolved = Path(d).resolve()
+        if resolved.is_dir() and resolved not in lookup_dirs:
+            lookup_dirs.append(resolved)
     seen = {}   # arcname -> resolved Path
     order = []  # resolved Paths, in discovery order
 
@@ -116,10 +130,14 @@ def collect_files(main, extra=(), max_bytes=MAX_BYTES_DEFAULT):
         path = queue[i]
         i += 1
         for name in _local_import_names(path):
-            candidate = src_dir / (name + ".py")
-            if candidate.is_file() and candidate.resolve() not in seen.values():
-                added = add(candidate)
-                queue.append(added)
+            for directory in lookup_dirs:
+                candidate = directory / (name + ".py")
+                if not candidate.is_file():
+                    continue
+                if candidate.resolve() in seen.values():
+                    break
+                queue.append(add(candidate))
+                break
 
     total = sum(p.stat().st_size for p in order)
     if total > max_bytes:

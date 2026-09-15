@@ -26,6 +26,49 @@ EXAMPLES_DIR = os.path.join(
     "components", "layers", "meta-fau-modem", "gr-fau_modem", "examples")
 
 
+class TestSearchDirs(unittest.TestCase):
+    """The Process phase's shape: the flowgraph is generated into a build
+    directory, but the helper module it imports never moved from beside the
+    .grc. Without search_dirs the transfer succeeds and the board dies on
+    ImportError -- a failure that looks exactly like success."""
+
+    def setUp(self):
+        root = tempfile.mkdtemp(prefix="fau_searchdirs_")
+        self.source = Path(root) / "project"
+        self.build = Path(root) / "build"
+        self.source.mkdir()
+        self.build.mkdir()
+        (self.source / "helper_mod.py").write_text("GAIN = 2.0\n")
+        (self.build / "fg.py").write_text("import helper_mod\n")
+
+    def test_without_search_dirs_the_sibling_is_missed(self):
+        entries, _main = P.collect_files(self.build / "fg.py")
+        self.assertEqual({arc for _, arc in entries}, {"fg.py"})
+
+    def test_with_the_source_dir_it_is_found(self):
+        entries, main_arc = P.collect_files(self.build / "fg.py",
+                                            search_dirs=(self.source,))
+        self.assertEqual(main_arc, "fg.py")
+        self.assertEqual({arc for _, arc in entries},
+                         {"fg.py", "helper_mod.py"})
+
+    def test_the_flowgraphs_own_directory_still_wins(self):
+        # A module present in both must resolve to the one beside the
+        # flowgraph being sent, not the one beside the source.
+        (self.build / "helper_mod.py").write_text("GAIN = 99.0\n")
+        entries, _main = P.collect_files(self.build / "fg.py",
+                                         search_dirs=(self.source,))
+        found = {arc: path for path, arc in entries}
+        self.assertEqual(found["helper_mod.py"].read_text(), "GAIN = 99.0\n")
+
+    def test_a_search_dir_that_does_not_exist_is_ignored(self):
+        entries, _main = P.collect_files(
+            self.build / "fg.py",
+            search_dirs=(self.source, self.source / "nope"))
+        self.assertEqual({arc for _, arc in entries},
+                         {"fg.py", "helper_mod.py"})
+
+
 class TestCollectRealExamples(unittest.TestCase):
     """Against the repo's own tx_sine.py -- the exact multi-file case this
     design exists for."""
