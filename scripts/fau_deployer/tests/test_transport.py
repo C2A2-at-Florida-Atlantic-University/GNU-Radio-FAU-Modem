@@ -12,6 +12,7 @@ covers the same LineReader driven by a real pty against a real receiver.
 
 import unittest
 
+from ..core.protocol import parse_line
 from ..core.transport import Transport, LineReader
 
 
@@ -118,6 +119,72 @@ class TestWaitFor(unittest.TestCase):
 
         second = r.wait_for("===MARKER===", 1.0)
         self.assertEqual(second, "===MARKER===")
+
+
+class TestWaitForLine(unittest.TestCase):
+    """A protocol sentinel is parsed after it is matched, so matching a
+    partial tail is worse than not matching at all. These reproduce the
+    real-serial-port framing that a pty never produces.
+    """
+
+    # What board/receiver.py actually emits, split the way a UART delivers
+    # it: the first read stops after the needle but before the '\n'.
+    READY = ("===FAU-RECV-READY v1 fbf3bd1a15804846 "
+             "dest=/home/petalinux/flowgraphs===")
+
+    def test_wait_for_truncates_a_fragmented_sentinel_at_the_needle(self):
+        # Documents WHY wait_for() must not be used for a parsed sentinel:
+        # it reports a match, but one stripped of every field after the
+        # needle -- which parse_line() then rejects, making a receiver that
+        # answered instantly look like it never answered at all.
+        t = FakeTransport([b"===FAU-RECV-READY v1 fbf3bd",
+                           b"1a15804846 dest=/home/petalinux/flowgraphs===\n"])
+        r = LineReader(t)
+        matched = r.wait_for("===FAU-RECV-READY", 1.0)
+        self.assertEqual(matched, "===FAU-RECV-READY")
+        self.assertIsNone(parse_line(matched))
+
+    def test_wait_for_line_returns_the_whole_line_when_fragmented(self):
+        t = FakeTransport([b"===FAU-RECV-READY v1 fbf3bd",
+                           b"1a15804846 dest=/home/petalinux/flowgraphs===\n"])
+        r = LineReader(t)
+        matched = r.wait_for_line("===FAU-RECV-READY", 1.0)
+        self.assertEqual(matched, self.READY)
+
+        parsed = parse_line(matched)
+        self.assertIsNotNone(parsed)
+        kind, fields = parsed
+        self.assertEqual(kind, "ready")
+        self.assertEqual(fields["version"], "v1")
+        self.assertEqual(fields["sha16"], "fbf3bd1a15804846")
+        self.assertEqual(fields["dest"], "/home/petalinux/flowgraphs")
+
+    def test_wait_for_line_survives_a_byte_at_a_time_trickle(self):
+        # The pathological end of the same problem: 115200 baud with a
+        # nearly-empty FIFO can hand back a single byte per read.
+        payload = (self.READY + "\n").encode("ascii")
+        t = FakeTransport([payload[i:i + 1] for i in range(len(payload))])
+        r = LineReader(t)
+        self.assertEqual(r.wait_for_line("===FAU-RECV-READY", 1.0), self.READY)
+
+    def test_wait_for_line_ignores_an_unterminated_tail(self):
+        # No trailing '\n' means the line is still arriving; matching it now
+        # is the bug this method exists to avoid.
+        t = FakeTransport([self.READY.encode("ascii")])
+        r = LineReader(t)
+        self.assertIsNone(r.wait_for_line("===FAU-RECV-READY", 0.05))
+
+    def test_wait_for_line_skips_preceding_noise_and_command_echo(self):
+        t = FakeTransport([
+            b"python3 /home/petalinux/.fau/receiver.py --dest x\r\n",
+            b"[  123.45] random kernel printk\n",
+            (self.READY + "\n").encode("ascii"),
+        ])
+        r = LineReader(t)
+        seen = []
+        matched = r.wait_for_line("===FAU-RECV-READY", 1.0, on_line=seen.append)
+        self.assertEqual(matched, self.READY)
+        self.assertIn("[  123.45] random kernel printk", seen)
 
 
 class TestDrainTo(unittest.TestCase):

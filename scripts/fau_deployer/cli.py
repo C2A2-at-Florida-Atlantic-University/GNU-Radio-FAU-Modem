@@ -9,9 +9,14 @@
 modules it imports) to a Zynq board over its serial console, and confirm it
 landed intact.
 
-Scope: transport only. This does NOT run the flowgraph on the board, parse
-or transform a .grc file, or offer a GUI -- see docs/plans/grc-deployer-plan.md
-for the full design and what's deliberately deferred past this pass.
+Does transport (--flowgraph), running (--run), and loading a pre-staged
+bitstream (--load-bitstream), against a board from bitstreams.json
+(--board) reached over an explicit --port. Composable in one invocation, in the order
+they have to happen: bitstream, then deploy, then run.
+
+Still NOT here: parsing or transforming a .grc file (the "Process" phase --
+input is a generated .py). See docs/plans/grc-deployer-plan.md. The
+interactive front-end over the same core is gui.py.
 
 Needs root: no. The board-side login user is a regular (non-root) account;
 nothing here touches /dev/mem or the DMA window itself.
@@ -19,16 +24,22 @@ nothing here touches /dev/mem or the DMA window itself.
 
 import argparse
 import os
+import signal
 import sys
 
-from .core import bootstrap, payload, report
+from .core import boards as boards_mod, bootstrap, fpga
+from .core import params as params_mod, payload, report
+from .core.boards import BoardsError
 from .core.bootstrap import BootstrapError
+from .core.fpga import FpgaError
+from .core.params import ParamError
 from .core.payload import PayloadError
 from .core.protocol import (
     CHUNK_B64_DEFAULT,
     DEST_DEFAULT,
     IDLE_TIMEOUT_DEFAULT,
 )
+from .core.runner import Runner
 from .core.sender import Sender, TransferError
 from .core.session import BoardSession, LoginError
 from .core.transport import LineReader, SerialTransport, Transcript, TransportError
@@ -42,7 +53,15 @@ EXIT_GENERIC = 1
 EXIT_USAGE = 2
 EXIT_SESSION = 3
 EXIT_TRANSFER = 4
+EXIT_BITSTREAM = 5
+EXIT_RUN = 6
+# Distinct from every other failure on purpose: it means a flowgraph was
+# stopped and never confirmed it halted, so the board may still have DMA
+# live. A CI job must be able to tell that apart from an ordinary failure.
+EXIT_WEDGED = 7
 EXIT_ABORT = 130
+
+RECEIVER_SHUTDOWN_TIMEOUT = 5.0
 
 
 def _build_parser():
@@ -51,29 +70,62 @@ def _build_parser():
         description="Ship a generated flowgraph to a Zynq board over its "
                     "serial console.")
 
-    p.add_argument("--flowgraph", required=True, metavar="PATH",
-                   help="the generated .py to deploy; its local sibling "
-                        "imports (e.g. a shared helper module next to it) "
-                        "are discovered automatically -- see --extra to add "
-                        "any this misses")
+    p.add_argument("--flowgraph", metavar="PATH",
+                   help="the generated .py to deploy and/or run; its local "
+                        "sibling imports (e.g. a shared helper module next "
+                        "to it) are discovered automatically -- see --extra "
+                        "to add any this misses. Required unless the only "
+                        "action asked for is --load-bitstream or "
+                        "--list-boards")
     p.add_argument("--extra", action="append", default=[], metavar="PATH",
                    help="an additional file to ship alongside --flowgraph; "
                         "repeatable")
 
-    p.add_argument("--port", required=True, metavar="DEV",
-                   help="serial device, e.g. /dev/ttyUSB0 (no auto-detect "
-                        "in this version -- must be given explicitly)")
-    p.add_argument("--baud", type=int, default=115200, metavar="BAUD",
-                   help="serial baud rate (default: %(default)d)")
+    p.add_argument("--board", metavar="NAME",
+                   help="which board in bitstreams.json (e.g. S10) -- "
+                        "selects the bitstreams --load-bitstream can reach "
+                        "(see --mode) and, with --credentials, the login. "
+                        "It says nothing about how to reach the board: pass "
+                        "--port for that")
+    p.add_argument("--bitstreams", metavar="PATH",
+                   default=boards_mod.BITSTREAMS_PATH_DEFAULT,
+                   help="bitstream file to read (default: %(default)s)")
+    p.add_argument("--credentials", metavar="PATH",
+                   default=boards_mod.CREDENTIALS_PATH_DEFAULT,
+                   help="credentials file for board logins (default: "
+                        "%(default)s). Optional and gitignored -- absent, "
+                        "the documented " + boards_mod.USER_DEFAULT + "/"
+                        + boards_mod.PASSWORD_DEFAULT + " is used")
+    p.add_argument("--mode", metavar="NAME",
+                   help="which of the board's bitstreams to load (e.g. "
+                        "bootstrap, tx, rx); only omittable when the board "
+                        "lists exactly one")
+    p.add_argument("--list-boards", action="store_true",
+                   help="print the bitstream file and exit")
 
-    p.add_argument("--user", default="petalinux", metavar="USER",
-                   help="board login user (default: %(default)s)")
-    p.add_argument("--password", default="1234", metavar="PASS",
-                   help="board login password (default: %(default)s)")
+    # These four default to None rather than a value, so "the operator gave
+    # this explicitly" stays distinguishable from "nobody said" -- which is
+    # what lets --board fill them in without silently overriding a flag.
+    p.add_argument("--port", required=False, metavar="DEV",
+                   help="serial device, e.g. /dev/ttyUSB0. Always required "
+                        "to talk to a board: port assignments are not "
+                        "static, so nothing records or guesses one. Prefer "
+                        "a /dev/serial/by-id path, since ttyUSB numbering "
+                        "swaps between boards on a replug")
+    p.add_argument("--baud", type=int, metavar="BAUD",
+                   help="serial baud rate (default: %d)"
+                        % boards_mod.BAUD_DEFAULT)
 
-    p.add_argument("--dest", default=DEST_DEFAULT, metavar="DIR",
+    p.add_argument("--user", metavar="USER",
+                   help="board login user (default: from --credentials, "
+                        "else %s)" % boards_mod.USER_DEFAULT)
+    p.add_argument("--password", metavar="PASS",
+                   help="board login password (default: from --credentials, "
+                        "else %s)" % boards_mod.PASSWORD_DEFAULT)
+
+    p.add_argument("--dest", metavar="DIR",
                    help="board-side directory the flowgraph is written into "
-                        "(default: %(default)s)")
+                        "(default: %s)" % DEST_DEFAULT)
     p.add_argument("--remote-dir", default=REMOTE_DIR_DEFAULT, metavar="DIR",
                    help="board-side directory the receiver tooling itself "
                         "lives in, kept separate from --dest so a future "
@@ -127,6 +179,33 @@ def _build_parser():
                    help="proceed even if the --eta-warn threshold is "
                         "exceeded")
 
+    p.add_argument("--load-bitstream", action="store_true",
+                   help="load the pre-staged bitstream for --board/--mode "
+                        "before anything else. This replaces the PL, so it "
+                        "runs first and only with nothing else in flight")
+    p.add_argument("--no-deploy", action="store_true",
+                   help="skip the transfer -- for running or re-running a "
+                        "flowgraph already on the board")
+    p.add_argument("--run", action="store_true",
+                   help="run the flowgraph on the board after deploying and "
+                        "stream its output. Ctrl-C stops it the safe way "
+                        "(SIGINT to the flowgraph, which tears the DMA down "
+                        "cleanly) rather than aborting this tool")
+    p.add_argument("--params", metavar="ARGS", default="",
+                   help="arguments to pass to the flowgraph, as one quoted "
+                        "string (e.g. --params '--nco-freq 2e6'). Split "
+                        "here and re-quoted per token, so shell "
+                        "metacharacters are passed through as data. "
+                        "Checked against the flowgraph's own options first")
+    p.add_argument("--no-sudo", action="store_true",
+                   help="run the flowgraph without sudo. The blocks open "
+                        "/dev/mem and lock under /run/lock, so this only "
+                        "makes sense when the login user is already root")
+    p.add_argument("--no-ground", action="store_true",
+                   help="adopt an already-logged-in console instead of "
+                        "logging out (Ctrl-D) and back in for a known-clean "
+                        "session")
+
     p.add_argument("--force-bootstrap", action="store_true",
                    help="push the receiver unconditionally, skipping the "
                         "already-current check")
@@ -152,10 +231,99 @@ def _validate(parser, args):
                     % args.chunk_size)
     if args.window < 1:
         parser.error("--window must be >= 1")
-    if args.baud <= 0:
+    if args.baud is not None and args.baud <= 0:
         parser.error("--baud must be > 0")
     if args.max_bytes <= 0:
         parser.error("--max-bytes must be > 0")
+    if args.no_deploy and not (args.run or args.load_bitstream):
+        parser.error("--no-deploy leaves nothing to do -- add --run and/or "
+                    "--load-bitstream")
+
+
+def _print_boards(bits, creds):
+    report.banner("BOARDS")
+    report.kv("bitstream file", bits.path)
+    for name in bits.names:
+        board = bits.board(name)
+        c = boards_mod.creds_for(creds, name)
+        report.blank()
+        report.kv("board", board.name)
+        report.kv("  login", "%s%s" % (
+            c.user, "" if name in creds else " (default, no credentials file)"))
+        for mode in board.modes:
+            seq = board.load_sequence(mode)
+            suffix = "" if len(seq) == 1 else "   (after %s)" % ", ".join(
+                n for n, _ in seq[:-1])
+            report.kv("  %s" % mode, board.bitstream(mode) + suffix)
+
+
+def _resolve_target(parser, args):
+    """Fill in port/baud/user/password/dest from --board (and the
+    credentials file) where the operator did not say, and pick the mode. An
+    explicit flag always wins: --board is a set of defaults, not an
+    override.
+
+    Returns the selected Mode (or None when no bitstream work was asked
+    for), and mutates args in place -- everything downstream then reads one
+    fully-resolved args and never has to know a board was involved.
+    """
+    board = None
+    creds = {}
+    if args.board or args.list_boards:
+        try:
+            bits = boards_mod.load_bitstreams(args.bitstreams)
+            creds = boards_mod.load_credentials(args.credentials)
+        except BoardsError as exc:
+            report.die(str(exc), code=EXIT_USAGE)
+        if args.list_boards:
+            _print_boards(bits, creds)
+            return None, True
+        try:
+            board = bits.board(args.board)
+        except BoardsError as exc:
+            report.die(str(exc), code=EXIT_USAGE)
+
+    board_creds = boards_mod.creds_for(creds, args.board) if args.board \
+        else boards_mod.BoardCreds()
+
+    if args.baud is None:
+        args.baud = boards_mod.BAUD_DEFAULT
+    if args.user is None:
+        args.user = board_creds.user
+    if args.password is None:
+        args.password = board_creds.password
+    if args.dest is None:
+        args.dest = DEST_DEFAULT
+
+    if not args.port and not args.dry_run:
+        # Never inferred from --board: bitstreams.json records nothing about
+        # how to reach a board, because a recorded port goes stale and
+        # deploys to the wrong one.
+        parser.error("no serial port -- pass --port (e.g. --port "
+                    "/dev/ttyUSB0). Port assignments are not static, so "
+                    "nothing records or guesses one")
+
+    steps = None
+    if args.load_bitstream:
+        if board is None:
+            parser.error("--load-bitstream needs --board NAME -- the "
+                        "bitstream to load is looked up in bitstreams.json, "
+                        "not passed by hand")
+        mode = args.mode or board.default_mode
+        if mode is None:
+            parser.error(
+                "board %r lists several bitstreams (%s) -- say which with "
+                "--mode" % (board.name, ", ".join(board.modes)))
+        try:
+            steps = board.load_sequence(mode)
+        except BoardsError as exc:
+            report.die(str(exc), code=EXIT_USAGE)
+        if mode != boards_mod.BOOTSTRAP_KEY and not board.has_bootstrap:
+            report.warn(
+                "board %r has no %r entry, so %r is being loaded on its own. "
+                "If this board needs a base design first, add one to %s"
+                % (board.name, boards_mod.BOOTSTRAP_KEY, mode, args.bitstreams))
+    return steps, False
 
 
 def _prepare_payload(args):
@@ -189,12 +357,96 @@ def _prepare_payload(args):
     return pl
 
 
+def _shutdown_receiver(session):
+    """Retire the board-side receiver once a transfer is done, the same way
+    core/bootstrap.py retires a stale one before pushing a fresh copy: 0x03
+    (ShutdownRequested on the board side), then wait for the shell to
+    actually reclaim the console.
+
+    Deliberate choice: this CLI is single-shot (one payload per invocation),
+    so there is nothing to keep the receiver alive for -- leaving it running
+    just has it idle until --idle-timeout elapses on its own for no benefit.
+    A fresh launch's READY handshake is sub-second, so there's no real cost
+    to tearing down every time; the next invocation just bootstraps again.
+    Best-effort: the deploy already succeeded by the time this runs, so a
+    failure here is a warning, not a fatal error.
+    """
+    if not session.interrupt_and_wait(RECEIVER_SHUTDOWN_TIMEOUT):
+        report.warn(
+            "receiver did not release the console within %.0fs of being "
+            "sent Ctrl-C after a successful transfer -- it will time out "
+            "on its own (--idle-timeout) instead" % RECEIVER_SHUTDOWN_TIMEOUT)
+
+
+
+def _run_flowgraph(session, transport, reader, args, main_name):
+    """Run the flowgraph in the foreground and stream its output.
+
+    Ctrl-C at the terminal must NOT abort this tool -- it must stop the
+    flowgraph. Aborting here would leave a flowgraph running on the board
+    with nobody holding its console, and the operator's next instinct
+    (re-run, or unplug) is how a live DMA burst gets orphaned. So SIGINT is
+    caught for the duration of the run and turned into the Runner's stop
+    request, which sends 0x03 to the board and then waits for the halt to
+    be confirmed. Repeated Ctrl-C is deliberately just as gentle: there is
+    no harder signal this tool is willing to send (see runner.terminate()).
+    """
+    try:
+        tokens = params_mod.check(args.params, args.flowgraph)
+    except ParamError as exc:
+        report.die(str(exc), code=EXIT_USAGE)
+
+    r = Runner(session, transport, reader, args.dest, main_name,
+               params=tokens, sudo=not args.no_sudo)
+    report.banner("RUN")
+    report.say("run", r.command)
+    report.say("run", "Ctrl-C stops the flowgraph (it does not abort "
+                      "fau-deploy)")
+
+    stop = {"asked": False}
+
+    def on_sigint(_sig, _frame):
+        stop["asked"] = True
+
+    previous = signal.signal(signal.SIGINT, on_sigint)
+    try:
+        result = r.run(on_line=lambda line: report.say("board", line),
+                       should_stop=lambda: stop["asked"])
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+    report.banner("RUN FINISHED")
+    report.kv("exit status", result.rc)
+    report.kv("stopped by operator", result.terminated)
+    report.kv("output lines", result.lines)
+    report.kv("elapsed", "%.1fs" % result.elapsed)
+
+    if result.wedged:
+        return EXIT_WEDGED
+    if result.rc:
+        return EXIT_RUN
+    return EXIT_OK
+
+
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
     _validate(parser, args)
 
-    pl = _prepare_payload(args)
+    steps, listed_only = _resolve_target(parser, args)
+    if listed_only:
+        return EXIT_OK
+
+    deploy = not args.no_deploy
+    if (deploy or args.run) and not args.flowgraph:
+        parser.error("--flowgraph is required to deploy or run "
+                    "(pass --no-deploy with neither to only load a "
+                    "bitstream)")
+
+    pl = _prepare_payload(args) if deploy else None
+    main_name = os.path.basename(args.flowgraph) if args.flowgraph else None
+    if pl is not None:
+        main_name = pl.main_arcname
     if args.dry_run:
         report.say("cli", "--dry-run: not opening the port")
         return EXIT_OK
@@ -206,36 +458,52 @@ def main(argv=None):
         report.die(str(exc), code=EXIT_USAGE)
 
     reader = LineReader(transport)
-    session = None
     try:
         report.banner("BOARD")
         session = BoardSession(transport, reader, user=args.user,
                               password=args.password,
                               login_timeout=args.login_timeout,
-                              verbose=args.verbose)
+                              verbose=args.verbose,
+                              ground=not args.no_ground)
         session.connect()
         report.say("cli", "logged in as %s" % args.user)
 
-        bootstrap.ensure_receiver(
-            session, transport, reader, RECEIVER_PATH,
-            remote_dir=args.remote_dir, dest=args.dest,
-            idle_timeout=args.idle_timeout, chunk_size=args.chunk_size,
-            handshake_timeout=args.handshake_timeout,
-            force=args.force_bootstrap)
+        # Bitstream first: it replaces the PL, so everything after it sees
+        # the hardware it is meant to run against, and nothing is in flight
+        # when the fabric goes away.
+        if steps is not None:
+            report.banner("BITSTREAM")
+            fpga.load_sequence(session, steps, password=args.password)
 
-        report.banner("TRANSFER")
-        sender = Sender(transport, reader, pl, args.dest, window=args.window,
-                        chunk_timeout=args.chunk_timeout,
-                        chunk_retries=args.chunk_retries,
-                        finish_timeout=args.finish_timeout,
-                        progress=not args.no_progress)
-        stats = sender.send()
+        if pl is not None:
+            bootstrap.ensure_receiver(
+                session, transport, reader, RECEIVER_PATH,
+                remote_dir=args.remote_dir, dest=args.dest,
+                idle_timeout=args.idle_timeout, chunk_size=args.chunk_size,
+                handshake_timeout=args.handshake_timeout,
+                force=args.force_bootstrap)
 
-        report.banner("DONE")
-        report.kv("chunks sent", stats.chunks)
-        report.kv("retransmits", stats.retransmits)
-        report.kv("elapsed", "%.1fs" % stats.elapsed)
-        report.say("cli", "deployed to %s:%s" % (args.port, args.dest))
+            report.banner("TRANSFER")
+            sender = Sender(transport, reader, pl, args.dest,
+                            window=args.window,
+                            chunk_timeout=args.chunk_timeout,
+                            chunk_retries=args.chunk_retries,
+                            finish_timeout=args.finish_timeout,
+                            progress=not args.no_progress)
+            stats = sender.send()
+            # Before any run: the receiver owns the console while it is
+            # alive, so a flowgraph launched under it would have its output
+            # eaten as protocol noise.
+            _shutdown_receiver(session)
+
+            report.banner("DONE")
+            report.kv("chunks sent", stats.chunks)
+            report.kv("retransmits", stats.retransmits)
+            report.kv("elapsed", "%.1fs" % stats.elapsed)
+            report.say("cli", "deployed to %s:%s" % (args.port, args.dest))
+
+        if args.run:
+            return _run_flowgraph(session, transport, reader, args, main_name)
         return EXIT_OK
 
     except LoginError as exc:
@@ -247,15 +515,13 @@ def main(argv=None):
     except TransferError as exc:
         report.error("transfer failed: %s" % exc)
         return EXIT_TRANSFER
+    except FpgaError as exc:
+        report.error("bitstream load failed: %s" % exc)
+        return EXIT_BITSTREAM
     except KeyboardInterrupt:
         report.error("aborted by operator")
         return EXIT_ABORT
     finally:
-        if session is not None:
-            try:
-                session.disconnect()
-            except Exception:
-                pass
         transport.close()
         if transcript is not None:
             transcript.close()

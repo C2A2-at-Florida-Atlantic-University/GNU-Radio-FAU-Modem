@@ -271,6 +271,36 @@ class LineReader:
                 return None
             self._pull(min(remaining, 1.0))
 
+    def wait_for_line(self, needle, timeout, on_line=None):
+        """Like wait_for, but only ever matches a COMPLETE ('\\n'-terminated)
+        line -- never the unterminated tail.
+
+        wait_for() matches a tail on purpose, because a shell prompt never
+        ends in '\\n'. That behaviour is wrong for a protocol sentinel: a
+        tail match returns the buffer sliced at the end of the NEEDLE, so
+        every field after it is missing and the caller's parse of the
+        "matched" text fails -- reporting the sentinel as absent when it
+        actually arrived. A pty hands over a whole line in one read, so this
+        only bites against a real serial port, where a 60+ char line
+        routinely spans several reads. Use this for anything that is parsed
+        after matching; use wait_for() only for a prompt.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            nl = self._buf.find("\n")
+            while nl != -1:
+                line = self._buf[:nl].rstrip("\r")
+                self._buf = self._buf[nl + 1:]
+                if on_line is not None:
+                    on_line(line)
+                if needle in line:
+                    return line
+                nl = self._buf.find("\n")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self._pull(min(remaining, 1.0))
+
     def drain_to(self, needle, timeout):
         """Like wait_for, but returns everything collected (all lines plus
         any partial tail) rather than just the matching fragment -- useful

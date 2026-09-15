@@ -1,0 +1,7 @@
+{
+    "S10": {
+        "bootstrap": "/home/petalinux/firmware/Radio_Top_v2_wrapper.bit.bin",
+        "tx": "/home/petalinux/S10_dac.bit.bin",
+        "rx": "/home/petalinux/S10_adc.bit.bin"
+    }
+}
