@@ -7,9 +7,20 @@
 #
 """A minimal getty+login emulator for testing core/session.py's PROBE state
 machine over a real pty, without a board. Handles only the login banner/
-credential exchange itself; on success it execs into a REAL shell (/bin/sh)
-so PS1 setup, command echo and run() are all exercised against genuine shell
-behavior rather than a second, possibly-unfaithful mock of one.
+credential exchange itself; on success it runs a REAL shell (/bin/sh) so
+shell hygiene setup, command echo and run() are all exercised against
+genuine shell behavior (including its own real default prompt) rather than
+a second, possibly-unfaithful mock of one.
+
+The shell is FORKED and waited for, not exec'd into. Exec was simpler but
+made the stub a one-shot: once the shell exited there was nothing left to
+present another login prompt, so it could not model the thing
+BoardSession.ground() depends on -- a real console where Ctrl-D logs out
+and getty immediately respawns `login:`. Forking makes the logout/login
+cycle testable and costs only the SIGINT/SIGTERM plumbing below (the parent
+has to ignore SIGINT so a Ctrl-C aimed at the foreground shell does not
+also take out the "getty" standing behind it, exactly as init does not die
+when a user interrupts their shell).
 
 Not part of the deployer -- test infrastructure only.
 """
@@ -35,15 +46,53 @@ def _readline():
     return line.rstrip("\r\n")
 
 
-def _exec_shell():
+_shell_pid = None
+
+
+def _kill_shell(_sig=None, _frame=None):
+    if _shell_pid is not None:
+        try:
+            os.kill(_shell_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    os._exit(0)
+
+
+def _shell_session():
+    """Run /bin/sh in the foreground until it exits (Ctrl-D, or `exit`),
+    then return so the caller can present a fresh login prompt."""
+    global _shell_pid
     sys.stdout.flush()
-    os.execvp("/bin/sh", ["/bin/sh"])
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, _kill_shell)
+    pid = os.fork()
+    if pid == 0:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        try:
+            os.execvp("/bin/sh", ["/bin/sh"])
+        finally:
+            os._exit(127)
+    _shell_pid = pid
+    os.waitpid(pid, 0)
+    _shell_pid = None
 
 
 def mode_prompt(args):
-    # Already "logged in" -- just hand straight to a real shell, exercising
-    # the 'prompt' PROBE branch (no login: banner at all).
-    _exec_shell()
+    # Already "logged in": a shell prompt and no login banner at all, which
+    # is the console state ground() exists for. Once that shell is logged
+    # out of, behave like getty and offer a login prompt again.
+    _shell_session()
+    return mode_login(args)
+
+
+def mode_norelogin(args):
+    # A console that hands out one shell and then NEVER offers a login
+    # prompt again -- the failure ground() has to report rather than retry
+    # forever (a shell with IGNOREEOF set looks like this from outside).
+    _shell_session()
+    while True:
+        time.sleep(3600)
 
 
 def mode_login(args):
@@ -59,7 +108,10 @@ def mode_login(args):
             return
         if user == args.user and password == args.password:
             _write("\n")
-            _exec_shell()
+            _shell_session()
+            # Logged out -- loop round and offer the login prompt again,
+            # the way getty respawns.
+            continue
         _write("Login incorrect\n\n")
 
 
@@ -106,6 +158,7 @@ def mode_orphan(args):
 
 MODES = {
     "prompt": mode_prompt,
+    "norelogin": mode_norelogin,
     "login": mode_login,
     "uboot": mode_uboot,
     "silent": mode_silent,
@@ -120,7 +173,13 @@ def main():
     p.add_argument("--password", default="1234")
     p.add_argument("--hostname", default="board")
     args = p.parse_args()
-    MODES[args.mode](args)
+    try:
+        MODES[args.mode](args)
+    except OSError:
+        # The test closed the pty master; writing to the slave now raises
+        # EIO. That is a normal end of life for this process, not a
+        # failure worth a traceback into a closed terminal.
+        pass
 
 
 if __name__ == "__main__":

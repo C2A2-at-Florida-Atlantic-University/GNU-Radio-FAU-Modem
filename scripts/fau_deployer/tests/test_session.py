@@ -96,11 +96,16 @@ class TestUBoot(SessionTestCase):
 
 
 class TestReconnect(SessionTestCase):
-    def test_second_session_reuses_the_already_configured_prompt(self):
+    def test_second_session_over_the_same_transport(self):
+        # A second BoardSession over the SAME transport/reader must end up
+        # with a working prompt. Since grounding became the default it gets
+        # there by logging out and back in rather than by adopting the
+        # first session's shell -- either way the contract this guards is
+        # that the second session's commands work and nothing is left
+        # desynced. The ground=False path (adopt it, no logout) is covered
+        # in test_ground.py.
         transport, reader = self._connect("prompt")
         BoardSession(transport, reader).connect()
-        # A second BoardSession over the SAME transport/reader must land in
-        # the 'ready' branch immediately rather than trying to log in again.
         sess2 = BoardSession(transport, reader)
         sess2.connect()
         rc, out = sess2.run("echo still-fine")

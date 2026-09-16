@@ -102,7 +102,7 @@ def push_file(session, local_path, remote_path, chunk_size=CHUNK_SIZE_DEFAULT):
 
 def _try_launch_and_read_ready(transport, reader, launch_cmd, timeout):
     """Send the launch command directly on the raw transport (NOT through
-    BoardSession.run() -- the receiver never prints our PS1 marker, it
+    BoardSession.run() -- the receiver never prints a FAU-RC: line, it
     prints READY and then stays running, so the shell-command abstraction
     doesn't apply once this line is sent). Returns the parsed ('ready',
     fields) tuple, or None if no READY sentinel arrived in time.
@@ -117,7 +117,11 @@ def _try_launch_and_read_ready(transport, reader, launch_cmd, timeout):
     hands the reader back to shell-command use).
     """
     transport.write((launch_cmd + "\r").encode("utf-8"))
-    matched = reader.wait_for("===FAU-RECV-READY", timeout)
+    # wait_for_LINE, not wait_for: the match is parsed below, so a tail
+    # match truncated at the end of the needle would drop version/sha16/
+    # dest and be misreported as "no receiver response" even though the
+    # receiver answered instantly. See LineReader.wait_for_line().
+    matched = reader.wait_for_line("===FAU-RECV-READY", timeout)
     if matched is None:
         reader.reset()
         return None
@@ -169,24 +173,40 @@ def ensure_receiver(session, transport, reader, local_receiver_path,
                       "receiver present but stale (board sha %s, local "
                       "sha %s) -- retiring it and pushing a fresh copy"
                       % (fields["sha16"], want_sha))
-            transport.write(b"\x03")  # ShutdownRequested on the board side
-            # Wait for the shell to actually reclaim the console (its PS1
-            # reappears once the receiver it was running exits) before
-            # sending anything else. Sending the next shell command too
-            # soon risks the still-dying receiver reading those bytes as
+            # Wait for the shell to actually reclaim the console (an idle
+            # prompt reappears once the receiver it was running exits)
+            # before sending anything else. Sending the next shell command
+            # too soon risks the still-dying receiver reading those bytes as
             # protocol noise and discarding them before it exits -- they
             # would never reach the shell at all, and the command that
             # follows would silently never have run.
-            reclaimed = reader.wait_for(session.ps1_marker, 5.0)
-            if reclaimed is None:
+            if not session.interrupt_and_wait(5.0):
                 raise BootstrapError(
                     "the stale receiver did not release the console within "
                     "5s of being sent Ctrl-C -- it may be wedged")
-            reader.reset()
         else:
             report.say("bootstrap",
                       "no receiver response within %.0fs -- pushing a "
                       "fresh copy" % handshake_timeout)
+            # No READY within the handshake window is NOT proof nothing is
+            # running -- the launch could have succeeded just slowly (a
+            # cold python3 start on a loaded board), or the READY line
+            # itself got dropped/garbled on a noisy console. Either way,
+            # proceeding straight to shell commands is unsafe: if a
+            # receiver actually is sitting there, every command below is
+            # silently swallowed as protocol noise (never reaches a shell,
+            # never errors, just looks like a hang) until something else
+            # retires it. Send the same retirement signal as the "stale"
+            # branch above -- harmless if nothing is running (Ctrl-C at an
+            # idle prompt is a no-op) and it costs nothing on the common
+            # path since a prompt is usually already sitting there.
+            if not session.interrupt_and_wait(5.0):
+                raise BootstrapError(
+                    "console did not settle to a shell prompt within 5s "
+                    "after a receiver launch attempt that never announced "
+                    "READY -- it may have started late and is still "
+                    "holding the console; try --force-bootstrap once it "
+                    "has, or re-run after a power cycle")
 
     session.run_ok("mkdir -p %s" % shlex.quote(remote_dir))
     got_sha = push_file(session, local_receiver_path, remote_path, chunk_size)

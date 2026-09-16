@@ -47,7 +47,7 @@ class SendStats:
 class Sender:
     def __init__(self, transport, reader, payload, dest, window=1,
                 chunk_timeout=3.0, chunk_retries=5, finish_timeout=30.0,
-                progress=True):
+                progress=True, on_progress=None, should_stop=None):
         self._transport = transport
         self._reader = reader
         self._payload = payload
@@ -57,12 +57,33 @@ class Sender:
         self._chunk_retries = chunk_retries
         self._finish_timeout = finish_timeout
         self._progress = progress
+        self._on_progress = on_progress
+        self._should_stop = should_stop
         self._aborted = False
 
     def _send_line(self, line):
         self._transport.write((line + "\n").encode("ascii"))
 
-    def _progress_line(self, acked, total, stats):
+    def _report_progress(self, acked, total, stats):
+        """Emit transfer progress to whichever front-ends asked for it: the
+        CLI's \r-rewritten console line, and/or a structured callback.
+
+        Two separate knobs rather than one, because they are not
+        alternatives -- `progress` writes a control character to a real
+        terminal and is meaningless in a GUI, while `on_progress` hands over
+        numbers with no presentation attached. A caller wanting both (a GUI
+        launched from a terminal) gets both.
+        """
+        if self._on_progress is not None:
+            elapsed = time.monotonic() - stats["t0"]
+            self._on_progress(acked, total, {
+                "retransmits": stats["retransmits"],
+                "naks": stats["naks"],
+                "timeouts": stats["timeouts"],
+                "bytes_on_wire": stats["bytes_on_wire"],
+                "elapsed": elapsed,
+                "rate": stats["bytes_on_wire"] / elapsed if elapsed > 0 else 0.0,
+            })
         if not self._progress:
             return
         elapsed = time.monotonic() - stats["t0"]
@@ -109,6 +130,21 @@ class Sender:
             return line
 
         while len(acked) < nchunks:
+            # Cancellation is checked here, at the top of the loop, rather
+            # than only between chunks: this is the one place guaranteed to
+            # be reached within POLL_INTERVAL no matter which branch below
+            # ran last, so a GUI's Cancel takes effect in well under a
+            # second even mid-retransmit. abort() first, so the receiver
+            # stops waiting on a transfer that is never going to finish
+            # instead of idling until --idle-timeout.
+            if self._should_stop is not None and self._should_stop():
+                self.abort()
+                raise TransferError(
+                    "transfer cancelled by the operator after %d/%d chunks "
+                    "-- nothing on the board was overwritten (the receiver "
+                    "only stages files once the whole payload validates)"
+                    % (len(acked), nchunks))
+
             # Fill the window.
             while len(unacked) < self._window and next_to_send < nchunks:
                 if next_to_send not in acked:
@@ -170,7 +206,7 @@ class Sender:
                     entry[0] = send_chunk(seq)
                     entry[1] = now
 
-            self._progress_line(len(acked), nchunks, stats)
+            self._report_progress(len(acked), nchunks, stats)
 
         if self._progress:
             print()  # newline after the final \r-rewritten progress line

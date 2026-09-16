@@ -11,3 +11,10 @@
 !**/system-user.dtsi
 
 modem_reference
+
+# Board serial-console logins for the flowgraph deployer. Tracked
+# counterparts: scripts/fau_deployer/devices.json (ports/bitstreams, no
+# secrets) and scripts/fau_deployer/json/example_credentials.json (copy it).
+# Mirrors ~/repos/Unified-FAU-Modem-Test-Tooling, which gitignores its own
+# credentials.json for the same reason.
+scripts/fau_deployer/credentials.json

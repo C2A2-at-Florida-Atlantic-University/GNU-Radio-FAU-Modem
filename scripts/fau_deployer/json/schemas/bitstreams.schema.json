@@ -1,0 +1,47 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://fau.edu/gnu-radio-fau-modem/schemas/bitstreams.schema.json",
+    "title": "BitstreamFile",
+    "description": "Bitstream file (bitstreams.json) for the FAU flowgraph deployer: each board, and the bitstream binaries it can be loaded with live via fpgautil. NOTHING about how to reach a board belongs here -- no serial port, baud rate or destination directory. Those are per-session facts an engineer sets from the Port menu or --port, because a port recorded in a file is a port that goes stale and deploys to the wrong board. Logins live in the gitignored credentials.json. Hand-maintained alongside core/boards.py's validation (this package is stdlib-only and does not use Pydantic); tests/test_boards.py validates the tracked files against this schema so the two cannot drift.",
+    "type": "object",
+    "minProperties": 1,
+    "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]+$",
+        "description": "Board name, e.g. 'S10'. Free-form, but kept to characters that survive a menu label and a command line."
+    },
+    "additionalProperties": {
+        "$ref": "#/$defs/BoardBitstreams"
+    },
+    "$defs": {
+        "BoardBitstreams": {
+            "type": "object",
+            "minProperties": 1,
+            "description": "Bitstream name -> board-side path. Names are free-form; 'bootstrap', 'tx' and 'rx' are the conventional ones, and 'bootstrap' is listed first wherever modes are offered. A mode this board does not have is simply an absent key -- there are no nulls and no placeholders.",
+            "propertyNames": {
+                "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Path ON THE BOARD to the bitstream: absolute, or relative to the login user's home (the deployer never changes directory before running fpgautil). Must be the bootgen-processed '.bit.bin' form that fpgautil's FPGA-manager path wants, not a raw Vivado '.bit'."
+            },
+            "properties": {
+                "bootstrap": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The baseline design this board is returned to. Conventional name only; it is loaded exactly like any other entry."
+                },
+                "tx": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The design that puts this board in TX/DAC mode, which is what fau_sink requires."
+                },
+                "rx": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The design that puts this board in RX/ADC mode, which is what fau_source requires."
+                }
+            }
+        }
+    }
+}
