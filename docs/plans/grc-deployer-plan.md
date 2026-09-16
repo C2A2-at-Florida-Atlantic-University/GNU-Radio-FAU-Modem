@@ -1,15 +1,113 @@
 # Plan: FAU GRC Deployer (desktop → board over UART)
 
-Status: **transport + run + bitstream-load + GUI implemented and tested
-(2026-09-03); still not run against real hardware.** The `.grc` "Process"
-phase is the one part of the pipeline still unbuilt, and the **live
-control channel** (QT GUI inputs rendered on the deployer, 2026-09-15
-section) is designed on top of it but likewise unbuilt. Everything below
-this line is the original design record; see the "Implementation status" section immediately below for
-what actually exists in `scripts/fau_deployer/` today and how it deviates
-from (or confirms) this doc. Companion to the root `CLAUDE.md` (which covers
-the blocks/PetaLinux side); this doc covers the **desktop-side deployment
-tooling**.
+Status: **the whole pipeline is built (Process phase 2026-09-15); the
+live control channel is the piece currently being built.** Nothing has run
+against real hardware yet. Everything below this line is the original
+design record; see the "Implementation status" sections immediately below
+for what actually exists in `scripts/fau_deployer/` today and how it
+deviates from (or confirms) this doc. Companion to the root `CLAUDE.md`
+(which covers the blocks/PetaLinux side); this doc covers the
+**desktop-side deployment tooling**.
+
+## Implementation status (2026-09-15) — the Process phase, live tracking, copyable log
+
+The last unbuilt piece of the pipeline is built: `--flowgraph` now accepts
+a `.grc`, and both front-ends compile one automatically rather than asking
+the operator to run `grcc` by hand.
+
+New modules, all in `core/`:
+
+- **`grcfile.py`** — a `.grc` is plain YAML, so it is read as YAML rather
+  than through `gnuradio.grc.core` (the lighter coupling the doc's
+  "Headless transform" section already argued for; it also means preflight
+  runs, and stays testable, on a machine without GNU Radio). Carries the
+  `file_format` version guard, Gate 1 (a FAU block must be present), and
+  target inference. **Both a `fau_source` and a `fau_sink` in one flowgraph
+  is refused** — TX and RX are two physically separate boards. A *disabled*
+  FAU block gets its own message, because "no FAU block" sends the operator
+  looking for one the flowgraph visibly has.
+- **`headless.py`** — the transform, on a deep copy; the operator's file is
+  never touched and the derived `<id>.headless.grc` is kept as an audit
+  artifact next to the generated `.py`. GUI blocks are classified from the
+  `value:` key and port domains GRC's own block YAML declares for each, so
+  the split follows the block definitions: sinks/decoration are deleted,
+  variable-defining controls are frozen to `variable` blocks at their
+  current value and reported, message-emitting controls **refuse** unless
+  explicitly allowed. An unrecognised `qtgui_*`/`variable_qtgui_*` id is
+  refused rather than waved through — waving it through means `grcc` emits
+  code that imports Qt, which is the exact failure the transform exists to
+  prevent. Throttles are flagged, not stripped.
+- **`generate.py`** — preflight, transform, `grcc` as a subprocess (never
+  `-r`), into a stable per-flowgraph build directory under
+  `$XDG_CACHE_HOME/fau_deployer/build`, keyed by the `.grc`'s absolute path
+  so two projects' `tx.grc` cannot overwrite each other.
+- **`watch.py`** — polls `stat()` and reports a change only once the stamp
+  has held still, so a poll landing mid-save does not hand a half-written
+  YAML to the parser. Not a thread: the front-end's own loop calls `poll()`.
+
+### Decisions made while building it (not in the original doc)
+
+- **`run_options` is forced to `run`, and that is a safety property, not a
+  preference.** `prompt` generates `input('Press Enter to quit: ')`, and
+  the flowgraph's stdin *is* the serial console the deployer is holding —
+  console noise or a stray newline would quit it out from under a live
+  DMA. `run` emits `tb.start(); tb.wait()`, leaving Ctrl-C (which
+  `core/runner.py` sends, and which the generated SIGINT handler turns into
+  `tb.stop()`) as the only way to stop it. This is the same `run_options:
+  run` the "Live flowgraph controls" section needs in order to free stdin,
+  so the two agree. Its known consequence — the generated handler calling
+  `tb.wait()` while the main thread is already in one, spawning a second
+  `_top_block_waiter` — is carried here too: a wart, not a hazard, since
+  the teardown is in the handler's `tb.stop()` and the shell's `FAU-RC`
+  status still proves the process was reaped. The fix lives with
+  `fau_ctl.start()` in that section.
+- **`grcc` runs with the `.grc`'s directory as its cwd and on its
+  `PYTHONPATH`.** Found the hard way: an `import` block is *evaluated*
+  during code generation, so a flowgraph that does `import fau_tx_common`
+  fails to compile at all when the headless copy is compiled from a build
+  directory the helper is nowhere near. It reads as "Flowgraph invalid",
+  i.e. as a problem with the flowgraph rather than with where it was
+  compiled from.
+- **`payload.collect_files()` gained `search_dirs`.** The generated `.py`
+  lives in the build directory but the sibling module it imports never left
+  the source directory; without this the transfer succeeds and the board
+  dies on `ImportError`, which is the worst shape of failure because it
+  looks like success.
+- **The target-inference gate is checked against the selected *mode*, not
+  the board.** A board's role is set by the bitstream in its PL, so the
+  Mode menu (which names that bitstream) is the only thing that can
+  contradict the flowgraph. A non-role mode key like `bootstrap` is
+  advisory only.
+- **Live tracking does not auto-deploy, only auto-*process*.** Sending a
+  new flowgraph to a board that is running one is a decision, not a reflex;
+  the GUI also refuses to regenerate at all while a transfer or run is in
+  flight. The CLI's `--watch` is therefore tied to `--process-only`.
+- **Deploy chains through `job_done`, not through the "processed" event.**
+  `job_done` is the one place that resets the GUI's state, so dispatching
+  the chained Deploy any earlier would have that reset land on top of
+  `DEPLOYING` and re-enable every button mid-transfer.
+- **The log pane needed explicit focus to become copyable.** A `-state
+  disabled` Tk text widget selects under the mouse, but Tk's own
+  `<Button-1>` binding refuses to focus it, so the class-level `<<Copy>>`
+  never fires: selecting worked and Ctrl-C did nothing. Fixed with
+  `takefocus`, an explicit `focus_set` on click, and its own Ctrl-C /
+  Ctrl-A / context-menu / Log-menu bindings. `see("end")` is now
+  conditional on the view already being at the bottom, so scrolling back to
+  read or select something is not undone by the next board line.
+
+Still absent, unchanged: **Gate 2** (enumerating the board's actual block
+set) and serial auto-detect. The null-sink splice is pure-YAML as the doc
+suggested starting; it takes the item type from the removed sink's own
+declared `type`, which is both correct and loudly wrong when it is not — a
+mismatched item size is an immediate `ValueError` from GNU Radio's
+`connect()`, not a silent corruption.
+
+Verified end to end against a real `grcc` (GNU Radio 3.10.1.1) on a
+flowgraph with a GUI range control, a tab widget, three GUI sinks, an
+orphaned branch and a sibling helper module: the generated `.py` imports no
+Qt, carries `blocks.null_sink(gr.sizeof_float*1)` on the orphaned port, the
+frozen variable at its GRC value, and `tb.start(); tb.wait()`. Still
+nothing run on a board.
 
 ## Implementation status (2026-08-31)
 

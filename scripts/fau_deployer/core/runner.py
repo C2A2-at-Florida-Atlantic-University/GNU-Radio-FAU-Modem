@@ -15,15 +15,19 @@ plan doc originally proposed). Two reasons, both load-bearing:
     def sig_handler(sig=None, frame=None):
         tb.stop(); tb.wait(); sys.exit(0)
     signal.signal(signal.SIGINT, sig_handler)
-  and tb.wait() returning is what runs the block destructors, which carry
-  the required DMACR.RS clear -> poll DMASR.Halted -> fabric reset. Nothing
-  needs to be added around it.
+  and it is `tb.stop()` that carries the required DMACR.RS clear -> poll
+  DMASR.Halted -> reset: the teardown lives in the blocks' `stop()`
+  overrides (fau_sink_impl.cc:421, fau_source_impl.cc:450), which
+  top_block.stop() calls. Their **destructors are empty**
+  (`~fau_sink_impl() {}`) -- an earlier version of this docstring credited
+  them, which matters because it is the reason nothing needs to be added
+  around the generated code. Nothing does.
 - **The shell's exit status is stronger evidence than a sentinel printed
-  from inside Python.** A `print("halted")` before the destructors run can
+  from inside Python.** A `print("halted")` before stop() has finished can
   be emitted and THEN wedge; `echo FAU-RC-<nonce>:$?` only appears once the
-  process is genuinely reaped, destructors included. So the completion
-  marker is the same FAU-RC mechanism core/session.py's run() uses, just
-  nonce-tagged so flowgraph stdout cannot forge it.
+  process is genuinely reaped. So the completion marker is the same FAU-RC
+  mechanism core/session.py's run() uses, just nonce-tagged so flowgraph
+  stdout cannot forge it.
 
 Foreground only, deliberately. Backgrounding with `&` would move the
 flowgraph out of the console's foreground process group, so Ctrl-C would no

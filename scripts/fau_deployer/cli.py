@@ -26,12 +26,15 @@ import argparse
 import os
 import signal
 import sys
+import time
 
-from .core import boards as boards_mod, bootstrap, fpga
-from .core import params as params_mod, payload, report
+from .core import boards as boards_mod, bootstrap, fpga, generate
+from .core import params as params_mod, payload, report, watch
 from .core.boards import BoardsError
 from .core.bootstrap import BootstrapError
 from .core.fpga import FpgaError
+from .core.generate import GenerateError
+from .core.grcfile import GrcError
 from .core.params import ParamError
 from .core.payload import PayloadError
 from .core.protocol import (
@@ -71,12 +74,14 @@ def _build_parser():
                     "serial console.")
 
     p.add_argument("--flowgraph", metavar="PATH",
-                   help="the generated .py to deploy and/or run; its local "
-                        "sibling imports (e.g. a shared helper module next "
-                        "to it) are discovered automatically -- see --extra "
-                        "to add any this misses. Required unless the only "
-                        "action asked for is --load-bitstream or "
-                        "--list-boards")
+                   help="the flowgraph to deploy and/or run: either a .grc, "
+                        "which is preflighted, made headless and compiled "
+                        "with grcc first, or an already-generated .py, which "
+                        "is sent as it is. Local sibling imports (e.g. a "
+                        "shared helper module next to it) are discovered "
+                        "automatically -- see --extra to add any this "
+                        "misses. Required unless the only action asked for "
+                        "is --load-bitstream or --list-boards")
     p.add_argument("--extra", action="append", default=[], metavar="PATH",
                    help="an additional file to ship alongside --flowgraph; "
                         "repeatable")
@@ -222,6 +227,40 @@ def _build_parser():
                    help="build the payload and print the manifest/ETA, but "
                         "never open the serial port")
 
+    g = p.add_argument_group(
+        "process (.grc -> .py)",
+        "Only meaningful when --flowgraph names a .grc. Compiling it needs "
+        "GNU Radio on THIS machine; the board never sees a .grc.")
+    g.add_argument("--process-only", action="store_true",
+                   help="preflight, transform and compile the .grc, print "
+                        "where the .py landed, and stop. Opens no port")
+    g.add_argument("--no-process", action="store_true",
+                   help="refuse to compile: fail if --flowgraph is a .grc. "
+                        "For a CI job that wants to be sure it is shipping a "
+                        "reviewed .py and not one generated on the spot")
+    g.add_argument("--allow-message-controls", action="store_true",
+                   help="proceed even though the flowgraph has GUI controls "
+                        "that send messages. Headless nobody presses them, "
+                        "so those messages never fire -- a change in what "
+                        "the flowgraph does, which is why it is not the "
+                        "default")
+    g.add_argument("--build-dir", metavar="DIR",
+                   help="where the headless copy and the generated .py go "
+                        "(default: a per-flowgraph directory under "
+                        "$XDG_CACHE_HOME/fau_deployer/build)")
+    g.add_argument("--grcc", default=generate.GRCC_DEFAULT, metavar="EXE",
+                   help="the GRC compiler to run (default: %(default)s)")
+    g.add_argument("--transform-only", action="store_true",
+                   help="write the headless .grc and print what changed, but "
+                        "do not run grcc. The derived file is the audit "
+                        "artifact -- diff it against the original")
+    g.add_argument("--watch", action="store_true",
+                   help="with --process-only, stay running and recompile "
+                        "every time the .grc is saved. Deploying is "
+                        "deliberately NOT automatic: sending a new flowgraph "
+                        "to a board that is running one is a decision, not a "
+                        "reflex")
+
     return p
 
 
@@ -235,6 +274,12 @@ def _validate(parser, args):
         parser.error("--baud must be > 0")
     if args.max_bytes <= 0:
         parser.error("--max-bytes must be > 0")
+    if args.watch and not args.process_only:
+        parser.error("--watch only makes sense with --process-only: a watch "
+                     "that redeployed on every save would ship a flowgraph "
+                     "to a board nobody is looking at")
+    if args.process_only and args.no_process:
+        parser.error("--process-only and --no-process contradict each other")
     if args.no_deploy and not (args.run or args.load_bitstream):
         parser.error("--no-deploy leaves nothing to do -- add --run and/or "
                     "--load-bitstream")
@@ -295,7 +340,10 @@ def _resolve_target(parser, args):
     if args.dest is None:
         args.dest = DEST_DEFAULT
 
-    if not args.port and not args.dry_run:
+    # --process-only is entirely local, like --dry-run: it compiles a
+    # .grc and stops, so demanding a port would mean plugging a board in
+    # to do code generation.
+    if not args.port and not (args.dry_run or args.process_only):
         # Never inferred from --board: bitstreams.json records nothing about
         # how to reach a board, because a recorded port goes stale and
         # deploys to the wrong one.
@@ -326,12 +374,90 @@ def _resolve_target(parser, args):
     return steps, False
 
 
+def _process(args):
+    """Turn a .grc into a .py, if that is what --flowgraph named.
+
+    Rewrites args.flowgraph to the generated file and records the source
+    directory in args.search_dirs, so everything downstream -- payload
+    assembly, --params checking, the name the board runs -- works on the
+    generated Python and never has to know a .grc was involved.
+
+    A .py --flowgraph passes straight through, which is what keeps the CI
+    path unchanged.
+    """
+    args.search_dirs = ()
+    args.generated = None
+    if not args.flowgraph or not generate.looks_like_grc(args.flowgraph):
+        if args.process_only:
+            report.die("--process-only needs a .grc; %s is already generated "
+                       "Python" % args.flowgraph, code=EXIT_USAGE)
+        return
+
+    if args.no_process:
+        report.die(
+            "--flowgraph %s is a .grc and --no-process was given. Compile it "
+            "yourself (grcc -o DIR %s) and pass the .py."
+            % (args.flowgraph, args.flowgraph), code=EXIT_USAGE)
+
+    try:
+        gen = generate.process(
+            args.flowgraph, expect_target=args.mode,
+            allow_message_controls=args.allow_message_controls,
+            build_dir=args.build_dir, grcc=args.grcc,
+            dry_run=args.transform_only)
+    except (GrcError, GenerateError) as exc:
+        report.die(str(exc), code=EXIT_USAGE)
+
+    args.generated = gen
+    if gen.py_path is None:  # --transform-only
+        return
+    args.flowgraph = gen.py_path
+    args.search_dirs = (gen.source_dir,)
+
+
+def _watch_process(args):
+    """--process-only --watch: recompile on every save until Ctrl-C.
+
+    Deliberately does not deploy. The point of watching is to keep the
+    generated .py honest while the flowgraph is being edited; pushing each
+    save to a board -- possibly one mid-run -- is a separate decision, and
+    one a tool should not make on its own.
+    """
+    w = watch.Watcher(args.flowgraph)
+    report.say("cli", "watching %s -- Ctrl-C to stop" % args.flowgraph)
+    try:
+        while True:
+            time.sleep(0.25)
+            if not w.poll():
+                continue
+            w.acknowledge()
+            report.blank()
+            report.say("cli", "%s changed -- reprocessing"
+                       % os.path.basename(args.flowgraph))
+            try:
+                generate.process(
+                    args.flowgraph, expect_target=args.mode,
+                    allow_message_controls=args.allow_message_controls,
+                    build_dir=args.build_dir, grcc=args.grcc,
+                    dry_run=args.transform_only)
+            except (GrcError, GenerateError) as exc:
+                # Keep watching. A flowgraph saved mid-edit is routinely
+                # invalid for a few seconds, and exiting on the first bad
+                # save would make the mode useless exactly when it helps.
+                report.error(str(exc))
+    except KeyboardInterrupt:
+        report.blank()
+        report.say("cli", "stopped watching")
+    return EXIT_OK
+
+
 def _prepare_payload(args):
     """Collect + build the payload, print the manifest/ETA banner. Returns
     the Payload, or exits with EXIT_USAGE on a PayloadError."""
     try:
         entries, main_arc = payload.collect_files(
-            args.flowgraph, extra=args.extra, max_bytes=args.max_bytes)
+            args.flowgraph, extra=args.extra, max_bytes=args.max_bytes,
+            search_dirs=getattr(args, "search_dirs", ()))
     except PayloadError as exc:
         report.die(str(exc), code=EXIT_USAGE)
 
@@ -437,11 +563,20 @@ def main(argv=None):
     if listed_only:
         return EXIT_OK
 
-    deploy = not args.no_deploy
+    deploy = not args.no_deploy and not args.process_only
     if (deploy or args.run) and not args.flowgraph:
         parser.error("--flowgraph is required to deploy or run "
                     "(pass --no-deploy with neither to only load a "
                     "bitstream)")
+
+    # Before anything opens a port: compiling a .grc is local, and failing
+    # here costs nothing, whereas failing after login leaves a session to
+    # tear down for no reason.
+    _process(args)
+    if args.process_only:
+        if args.watch:
+            return _watch_process(args)
+        return EXIT_OK
 
     pl = _prepare_payload(args) if deploy else None
     main_name = os.path.basename(args.flowgraph) if args.flowgraph else None

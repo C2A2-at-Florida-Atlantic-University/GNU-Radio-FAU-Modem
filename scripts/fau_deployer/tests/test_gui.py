@@ -13,6 +13,11 @@ running" and "reload the PL while DMA is live" have to be impossible, not
 merely discouraged. The second of those can wedge the board (core/fpga.py),
 which makes button gating a safety property.
 
+Three more things here are behaviour rather than layout and are tested as
+such: the log pane must be copyable (a read-only Tk text widget is not, by
+default -- see App._bind_log), the file watcher must invalidate a stale
+generated .py, and Deploy on a .grc must process BEFORE it sends.
+
 Skipped without a display. No mainloop is entered and the window is
 withdrawn, so nothing appears on screen; widget construction still happens
 for real, which is what catches a typo'd option that would otherwise only
@@ -20,6 +25,8 @@ show up when somebody opens the tool.
 """
 
 import os
+import shutil
+import tempfile
 import unittest
 
 HAVE_DISPLAY = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -76,12 +83,6 @@ class TestConstruction(GuiTestCase):
         self.assertIsNone(self.app.bitstreams_error)
         self.assertIn(self.app.var_board.get(), self.app.bitstreams.names)
 
-    def test_process_is_a_visible_disabled_placeholder(self):
-        # Present so the pipeline reads as three phases, disabled because
-        # none of it exists in core yet.
-        self.assertEqual(_state(self.app.btn_process), "disabled")
-        self.assertEqual(_text(self.app.btn_process), "Process")
-
     def test_log_pane_is_read_only_and_accepts_lines(self):
         self.app._log("hello")
         self.app._log("bad", True)
@@ -89,6 +90,395 @@ class TestConstruction(GuiTestCase):
         contents = self.app.log.get("1.0", "end")
         self.assertIn("hello", contents)
         self.assertIn("bad", contents)
+
+
+class TestProcessButton(GuiTestCase):
+    def test_nothing_selected_means_nothing_to_process(self):
+        self.app.var_path.set("")
+        self.app._set_state(gui.IDLE)
+        self.assertEqual(_state(self.app.btn_process), "disabled")
+
+    def test_a_generated_py_has_nothing_to_process(self):
+        self.app.var_path.set("/tmp/fg.py")
+        self.app._set_state(gui.IDLE)
+        self.assertEqual(_state(self.app.btn_process), "disabled")
+
+    def test_a_grc_enables_it_with_no_port_at_all(self):
+        # Process is entirely local: compiling a flowgraph must not require
+        # a board to be plugged in.
+        self.app.var_port_override.set("")
+        self.app.var_path.set("/tmp/fg.grc")
+        self.app._set_state(gui.IDLE)
+        self.assertEqual(_state(self.app.btn_process), "normal")
+
+    def test_it_is_disabled_and_labelled_while_processing(self):
+        self.app.var_path.set("/tmp/fg.grc")
+        self.app._set_state(gui.PROCESSING)
+        self.assertEqual(_state(self.app.btn_process), "disabled")
+        self.assertEqual(_text(self.app.btn_process), "Processing...")
+
+    def test_nothing_else_may_run_while_processing(self):
+        self._select_ready()
+        self.app.var_path.set("/tmp/fg.grc")
+        self.app._set_state(gui.PROCESSING)
+        self.assertEqual(_state(self.app.btn_deploy), "disabled")
+        self.assertEqual(_state(self.app.btn_run), "disabled")
+        self.assertEqual(_state(self.app.btn_browse), "disabled")
+
+
+class TestLogCopy(GuiTestCase):
+    """A -state disabled Tk text widget selects under the mouse but refuses
+    keyboard focus, so the class-level <<Copy>> never fires: it looks
+    copyable and is not. These pin the explicit bindings that fix it."""
+
+    def setUp(self):
+        super().setUp()
+        # Construction already logged which bitstream file was loaded, and
+        # these tests index from "1.0".
+        self.app._clear_log()
+        self.app._log("first line")
+        self.app._log("second line")
+
+    def _select(self, start, end):
+        self.app.log.tag_add("sel", start, end)
+
+    def _spy_on_see(self, at_bottom=True):
+        """Record see() calls instead of performing them, and say where the
+        view is.
+
+        The window is withdrawn, so the text widget has no geometry and
+        yview() reports nonsense -- _at_bottom() is unavoidably a question
+        about a real mapped widget. What _log DECIDES from it is not, and
+        that decision (chase the tail only if the reader was already at it)
+        is the behaviour worth pinning.
+        """
+        calls = []
+        self.app.log.see = calls.append
+        self.app._at_bottom = lambda: at_bottom
+        return calls
+
+    def test_the_log_can_take_focus_despite_being_read_only(self):
+        self.assertTrue(bool(self.app.log.cget("takefocus")))
+
+    def test_button_1_is_wired_to_take_focus(self):
+        # The fix for "selecting works but Ctrl-C does nothing": Tk's own
+        # <Button-1> binding refuses to focus a -state disabled text
+        # widget, so the widget must ask for focus itself. X focus cannot
+        # be asserted against a withdrawn window, so what is pinned here is
+        # the wiring and that the handler calls focus_set.
+        self.assertIn("_on_log_click", self.app.log.bind("<Button-1>"))
+        focused = []
+        self.app.log.focus_set = lambda: focused.append(True)
+        self.app._on_log_click(None)
+        self.assertEqual(focused, [True])
+
+    def test_copying_a_selection_puts_it_on_the_clipboard(self):
+        self._select("1.0", "1.5")
+        self.app._copy_selection()
+        self.assertEqual(self.root.clipboard_get(), "first")
+
+    def test_select_all_then_copy_takes_the_whole_log(self):
+        self.app._select_all()
+        self.app._copy_selection()
+        self.assertIn("first line", self.root.clipboard_get())
+        self.assertIn("second line", self.root.clipboard_get())
+
+    def test_copy_everything_needs_no_selection(self):
+        self.app._copy_all()
+        self.assertIn("second line", self.root.clipboard_get())
+
+    def test_copying_nothing_says_so_instead_of_raising(self):
+        # sel.first raises when there is no selection; an operator pressing
+        # Ctrl-C with nothing selected must get a line in the log, not a
+        # traceback on a stdout they are not watching.
+        self.app.log.tag_remove("sel", "1.0", "end")
+        self.app._copy_selection()
+        self.assertIn("nothing selected", self.app.log.get("1.0", "end"))
+
+    def test_ctrl_c_is_bound_on_the_widget_itself(self):
+        self.assertTrue(self.app.log.bind("<Control-c>"))
+        self.assertTrue(self.app.log.bind("<Control-a>"))
+
+    def test_clearing_empties_it_and_resumes_following(self):
+        self.app.var_follow.set(False)
+        self.app._clear_log()
+        self.assertEqual(self.app.log.get("1.0", "end").strip(), "")
+        self.assertTrue(self.app.var_follow.get())
+
+    def test_new_output_does_not_scroll_away_from_a_reader(self):
+        # Scrolling up to read or select something must survive the next
+        # board line, or the pane is unusable exactly when it matters.
+        self.app.var_follow.set(False)
+        calls = self._spy_on_see(at_bottom=True)
+        self.app._log("and another")
+        self.assertEqual(calls, [])
+
+    def test_a_view_scrolled_off_the_bottom_is_left_alone(self):
+        # The automatic half: no checkbox needed, having scrolled up IS the
+        # request to stop moving.
+        self.app.var_follow.set(True)
+        calls = self._spy_on_see(at_bottom=False)
+        self.app._log("and another")
+        self.assertEqual(calls, [])
+
+    def test_following_chases_the_tail(self):
+        self.app.var_follow.set(True)
+        calls = self._spy_on_see(at_bottom=True)
+        self.app._log("and another")
+        self.assertEqual(calls, ["end"])
+
+    def test_turning_following_back_on_jumps_to_the_end(self):
+        self.app.var_follow.set(False)
+        calls = self._spy_on_see()
+        self.app.var_follow.set(True)
+        self.app._on_follow_toggled()
+        self.assertEqual(calls, ["end"])
+
+
+class FakeGenerated:
+    """Stands in for core.generate.Generated.
+
+    A real one needs grcc; what the GUI actually consumes from it is four
+    attributes and a staleness answer, so that is what this provides.
+    """
+
+    def __init__(self, grc_path, py_path, stale=False, source_dir=None):
+        self.grc_path = os.path.abspath(grc_path)
+        self.py_path = py_path
+        self.headless_grc = py_path + ".headless.grc"
+        self.build_dir = os.path.dirname(py_path)
+        self.target = "rx"
+        self.transform_report = None
+        self.stale = stale
+        self._source_dir = source_dir or os.path.dirname(self.grc_path)
+
+    @property
+    def source_dir(self):
+        return self._source_dir
+
+    @property
+    def main_name(self):
+        return os.path.basename(self.py_path)
+
+    def is_stale(self):
+        return self.stale
+
+
+class FlowgraphTestCase(GuiTestCase):
+    """A real .grc and a real generated .py on disk, and a worker whose
+    submit() only records -- nothing here should run grcc or open a port."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp(prefix="fau_gui_")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.grc = os.path.join(self.dir, "rx_demo.grc")
+        with open(self.grc, "w") as fh:
+            fh.write("options: {}\nblocks: []\n")
+        self.py = os.path.join(self.dir, "rx_demo.py")
+        with open(self.py, "w") as fh:
+            fh.write("# generated\n")
+
+        self.jobs = []
+        self.app.worker.submit = (
+            lambda name, fn, settings: self.jobs.append((name, fn, settings)))
+
+    def _fresh(self):
+        return FakeGenerated(self.grc, self.py, stale=False)
+
+    def _stale(self):
+        return FakeGenerated(self.grc, self.py, stale=True)
+
+    def _touch(self, path):
+        st = os.stat(path)
+        bumped = st.st_mtime_ns + 10_000_000
+        os.utime(path, ns=(bumped, bumped))
+
+
+class TestPathTracking(FlowgraphTestCase):
+    def test_selecting_a_file_points_the_watcher_at_it(self):
+        self.app.var_path.set(self.grc)
+        self.assertEqual(self.app.watcher.path, self.grc)
+
+    def test_switching_flowgraphs_drops_the_previous_generated_python(self):
+        # Otherwise Deploy would send the .py built from the file that was
+        # selected a moment ago -- the exact wrong-file bug.
+        self.app.var_path.set(self.grc)
+        self.app.generated = self._fresh()
+        other = os.path.join(self.dir, "other.grc")
+        with open(other, "w") as fh:
+            fh.write("options: {}\nblocks: []\n")
+        self.app.var_path.set(other)
+        self.assertIsNone(self.app.generated)
+
+    def test_a_generated_result_for_a_different_grc_is_not_fresh(self):
+        self.app.var_path.set(self.grc)
+        self.app.generated = FakeGenerated("/elsewhere/other.grc", self.py)
+        self.assertIsNone(self.app._fresh_generated())
+
+    def test_a_stale_result_is_not_fresh(self):
+        self.app.var_path.set(self.grc)
+        self.app.generated = self._stale()
+        self.assertIsNone(self.app._fresh_generated())
+
+    def test_the_tracking_line_says_what_it_is_watching(self):
+        self.app.var_path.set(self.grc)
+        self.assertIn("rx_demo.grc", self.app.var_track.get())
+        self.assertIn("not processed yet", self.app.var_track.get())
+
+    def test_the_tracking_line_says_when_the_python_is_out_of_date(self):
+        self.app.var_path.set(self.grc)
+        self.app.generated = self._stale()
+        self.app._refresh_track()
+        self.assertIn("out of date", self.app.var_track.get())
+
+    def test_the_tracking_line_names_the_generated_file_when_current(self):
+        self.app.var_path.set(self.grc)
+        self.app.generated = self._fresh()
+        self.app._refresh_track()
+        self.assertIn("rx_demo.py", self.app.var_track.get())
+        self.assertIn("up to date", self.app.var_track.get())
+
+    def test_a_py_is_described_as_needing_no_processing(self):
+        self.app.var_path.set(self.py)
+        self.assertIn("already generated", self.app.var_track.get())
+
+    def test_a_changed_py_says_it_will_be_re_read(self):
+        self.app.var_path.set(self.py)
+        self.app.watcher.changed = True
+        self.app._refresh_track()
+        self.assertIn("re-reads it", self.app.var_track.get())
+
+    def test_a_missing_file_is_called_out(self):
+        self.app.var_path.set(os.path.join(self.dir, "gone.grc"))
+        self.assertIn("does not exist", self.app.var_track.get())
+
+
+class TestAutoProcessOnChange(FlowgraphTestCase):
+    def _change_and_settle(self):
+        self._touch(self.grc)
+        self.app.watcher.poll()
+        self.app.watcher._pending_since -= 10.0   # skip the settle window
+        return self.app.watcher.poll()
+
+    def test_a_saved_grc_queues_a_process_job(self):
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.assertTrue(self._change_and_settle())
+        self.app._on_file_changed()
+        self.assertEqual([name for name, _fn, _s in self.jobs], ["process"])
+        self.assertEqual(self.app.state, gui.PROCESSING)
+
+    def test_with_auto_processing_off_it_only_says_so(self):
+        self.app.var_autoprocess.set(False)
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.app._on_file_changed()
+        self.assertEqual(self.jobs, [])
+        self.assertIn("auto-processing is off", self.app.log.get("1.0", "end"))
+
+    def test_nothing_is_regenerated_while_a_flowgraph_is_running(self):
+        # Swapping the generated file under a live run is not a thing to do
+        # quietly, whatever the file on disk did.
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.RUNNING)
+        self.app._on_file_changed()
+        self.assertEqual(self.jobs, [])
+        self.assertIn("will not re-process", self.app.log.get("1.0", "end"))
+
+    def test_a_changed_py_is_noted_but_nothing_is_generated(self):
+        self.app.var_path.set(self.py)
+        self.app._set_state(gui.IDLE)
+        self.app._on_file_changed()
+        self.assertEqual(self.jobs, [])
+        self.assertIn("re-read from disk", self.app.log.get("1.0", "end"))
+
+    def test_processing_rebaselines_the_watcher(self):
+        self.app.var_path.set(self.grc)
+        self._change_and_settle()
+        self.assertTrue(self.app.watcher.changed)
+        self.app._handle_event(("processed", self._fresh()))
+        self.assertFalse(self.app.watcher.changed)
+
+
+class TestProcessBeforeDeploy(FlowgraphTestCase):
+    def setUp(self):
+        super().setUp()
+        self._select_ready()
+
+    def test_deploying_a_grc_processes_first(self):
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.app._on_deploy()
+        self.assertEqual([name for name, _fn, _s in self.jobs], ["process"])
+        self.assertEqual(self.app.after_process, "deploy")
+
+    def test_running_a_grc_processes_first(self):
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.app._on_run()
+        self.assertEqual([name for name, _fn, _s in self.jobs], ["process"])
+        self.assertEqual(self.app.after_process, "run")
+
+    def test_an_up_to_date_grc_is_not_re_processed(self):
+        self.app.var_path.set(self.grc)
+        self.app.generated = self._fresh()
+        self.app._set_state(gui.IDLE)
+        self.app._on_deploy()
+        self.assertEqual([name for name, _fn, _s in self.jobs], ["deploy"])
+
+    def test_the_file_sent_for_a_grc_is_the_generated_python(self):
+        self.app.var_path.set(self.grc)
+        self.app.generated = self._fresh()
+        source, dirs = self.app._deploy_source()
+        self.assertEqual(source, self.py)
+        # The .grc's directory has to be searched for sibling modules: the
+        # generated file lives in the build dir, the helper it imports does
+        # not.
+        self.assertEqual(tuple(dirs), (self.dir,))
+
+    def test_a_py_is_sent_as_it_is(self):
+        self.app.var_path.set(self.py)
+        source, dirs = self.app._deploy_source()
+        self.assertEqual(source, self.py)
+        self.assertEqual(tuple(dirs), ())
+
+    def test_the_chained_action_runs_only_after_the_job_finishes(self):
+        # The continuation has to wait for job_done, which is the one place
+        # that resets the state -- dispatching from "processed" would have
+        # the reset land on top of DEPLOYING and re-enable every button
+        # mid-transfer.
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.app._on_deploy()
+        self.jobs.clear()
+        self.app._handle_event(("processed", self._fresh()))
+        self.assertEqual(self.jobs, [])
+        self.app._handle_event(("job_done", "process"))
+        self.assertEqual([name for name, _fn, _s in self.jobs], ["deploy"])
+
+    def test_a_failed_process_cancels_the_chained_deploy(self):
+        # No "processed" event means no generated file; deploying anyway
+        # would send whatever .py was in the build directory already.
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.app._on_deploy()
+        self.jobs.clear()
+        self.app._handle_event(("failed", "process", "grcc said no"))
+        self.app._handle_event(("job_done", "process"))
+        self.assertEqual(self.jobs, [])
+        self.assertIn("cancelled", self.app.log.get("1.0", "end"))
+
+    def test_the_chain_is_consumed_and_does_not_fire_twice(self):
+        self.app.var_path.set(self.grc)
+        self.app._set_state(gui.IDLE)
+        self.app._on_deploy()
+        self.app._handle_event(("processed", self._fresh()))
+        self.app._handle_event(("job_done", "process"))
+        self.jobs.clear()
+        self.app._handle_event(("job_done", "process"))
+        self.assertEqual(self.jobs, [])
+        self.assertIsNone(self.app.after_process)
 
 
 class TestActionGating(GuiTestCase):

@@ -18,3 +18,7 @@ modem_reference
 # Mirrors ~/repos/Unified-FAU-Modem-Test-Tooling, which gitignores its own
 # credentials.json for the same reason.
 scripts/fau_deployer/credentials.json
+
+# Python bytecode from the deployer tooling.
+__pycache__/
+*.py[cod]
