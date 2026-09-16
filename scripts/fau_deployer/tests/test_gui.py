@@ -238,11 +238,13 @@ class TestLogCopy(GuiTestCase):
 class FakeGenerated:
     """Stands in for core.generate.Generated.
 
-    A real one needs grcc; what the GUI actually consumes from it is four
-    attributes and a staleness answer, so that is what this provides.
+    A real one needs grcc; what the GUI actually consumes from it is a
+    handful of attributes and a staleness answer, so that is what this
+    provides.
     """
 
-    def __init__(self, grc_path, py_path, stale=False, source_dir=None):
+    def __init__(self, grc_path, py_path, stale=False, source_dir=None,
+                 controls=(), spec_path=None):
         self.grc_path = os.path.abspath(grc_path)
         self.py_path = py_path
         self.headless_grc = py_path + ".headless.grc"
@@ -251,6 +253,12 @@ class FakeGenerated:
         self.transform_report = None
         self.stale = stale
         self._source_dir = source_dir or os.path.dirname(self.grc_path)
+        self.controls = list(controls)
+        self.spec_path = spec_path
+
+    @property
+    def extra_files(self):
+        return (self.spec_path,) if self.spec_path else ()
 
     @property
     def source_dir(self):
@@ -430,7 +438,7 @@ class TestProcessBeforeDeploy(FlowgraphTestCase):
     def test_the_file_sent_for_a_grc_is_the_generated_python(self):
         self.app.var_path.set(self.grc)
         self.app.generated = self._fresh()
-        source, dirs = self.app._deploy_source()
+        source, dirs, _extra = self.app._deploy_source()
         self.assertEqual(source, self.py)
         # The .grc's directory has to be searched for sibling modules: the
         # generated file lives in the build dir, the helper it imports does
@@ -439,7 +447,7 @@ class TestProcessBeforeDeploy(FlowgraphTestCase):
 
     def test_a_py_is_sent_as_it_is(self):
         self.app.var_path.set(self.py)
-        source, dirs = self.app._deploy_source()
+        source, dirs, _extra = self.app._deploy_source()
         self.assertEqual(source, self.py)
         self.assertEqual(tuple(dirs), ())
 

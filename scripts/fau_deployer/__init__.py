@@ -21,6 +21,15 @@ always generated from the flowgraph as it stands now rather than from the
 save before last. Only that phase needs GNU Radio installed on the desktop;
 deploying a `.py` needs nothing but pyserial.
 
+A flowgraph's **QT GUI input blocks** (Range, Entry, Chooser, Check Box,
+Push Button) survive going headless as live controls: the transform records
+them in a `ui_spec.json` before freezing each to a plain `variable`, ships
+that and `board/fau_ctl.py` alongside the generated `.py`, and the deployer
+renders them as widgets that drive the running flowgraph over the same
+console. `--list-controls` prints them; `--set id=value` applies one at
+launch. QT GUI *sinks* are permanently out of scope -- a time sink at
+400 ksps is ~3.2 MB/s against a console that carries ~11.5 KB/s.
+
 See docs/plans/grc-deployer-plan.md for the full design and every decision's
 reasoning, and scripts/fau_deployer/tests/ for the harness that exercises
 all of it -- protocol, login/grounding, run and bitstream load -- against

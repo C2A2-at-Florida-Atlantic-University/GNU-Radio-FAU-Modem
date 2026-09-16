@@ -29,8 +29,10 @@ import sys
 import time
 
 from .core import boards as boards_mod, bootstrap, fpga, generate
+from .core import controls as controls_mod
 from .core import params as params_mod, payload, report, watch
 from .core.boards import BoardsError
+from .core.controls import ControlError
 from .core.bootstrap import BootstrapError
 from .core.fpga import FpgaError
 from .core.generate import GenerateError
@@ -42,7 +44,7 @@ from .core.protocol import (
     DEST_DEFAULT,
     IDLE_TIMEOUT_DEFAULT,
 )
-from .core.runner import Runner
+from .core.runner import RunError, Runner
 from .core.sender import Sender, TransferError
 from .core.session import BoardSession, LoginError
 from .core.transport import LineReader, SerialTransport, Transcript, TransportError
@@ -254,6 +256,17 @@ def _build_parser():
                    help="write the headless .grc and print what changed, but "
                         "do not run grcc. The derived file is the audit "
                         "artifact -- diff it against the original")
+    g.add_argument("--list-controls", action="store_true",
+                   help="print the flowgraph's QT GUI input controls (what "
+                        "the GUI would render as a control panel) and exit. "
+                        "Needs a .grc: the control spec is built by the "
+                        "transform.")
+    g.add_argument("--set", action="append", default=[], metavar="ID=VALUE",
+                   dest="set_controls",
+                   help="set a control to VALUE once the flowgraph is "
+                        "running. Repeatable. Applied in the order given, "
+                        "after the run starts. Live control from the CLI is "
+                        "not planned -- that is what the GUI is for.")
     g.add_argument("--watch", action="store_true",
                    help="with --process-only, stay running and recompile "
                         "every time the .grc is saved. Deploying is "
@@ -283,6 +296,13 @@ def _validate(parser, args):
     if args.no_deploy and not (args.run or args.load_bitstream):
         parser.error("--no-deploy leaves nothing to do -- add --run and/or "
                     "--load-bitstream")
+    if args.set_controls and not args.run:
+        parser.error("--set needs --run: a control only exists while the "
+                     "flowgraph is running, and writing to the console at "
+                     "any other time would be typing at the board's shell")
+    for item in args.set_controls:
+        if "=" not in item:
+            parser.error("--set wants ID=VALUE (got %r)" % item)
 
 
 def _print_boards(bits, creds):
@@ -340,10 +360,11 @@ def _resolve_target(parser, args):
     if args.dest is None:
         args.dest = DEST_DEFAULT
 
-    # --process-only is entirely local, like --dry-run: it compiles a
-    # .grc and stops, so demanding a port would mean plugging a board in
-    # to do code generation.
-    if not args.port and not (args.dry_run or args.process_only):
+    # --process-only and --list-controls are entirely local, like
+    # --dry-run: they compile a .grc and stop, so demanding a port would
+    # mean plugging a board in to do code generation.
+    if not args.port and not (args.dry_run or args.process_only
+                              or args.list_controls):
         # Never inferred from --board: bitstreams.json records nothing about
         # how to reach a board, because a recorded port goes stale and
         # deploys to the wrong one.
@@ -451,12 +472,91 @@ def _watch_process(args):
     return EXIT_OK
 
 
+def _print_controls(args):
+    """--list-controls: the read-only half of the control channel.
+
+    Live control from the CLI is deliberately not planned -- a slider is a
+    GUI thing. What the CLI needs is to be able to SAY what is settable, so
+    that a --set typo can be diagnosed without opening the GUI.
+    """
+    gen = getattr(args, "generated", None)
+    if gen is None:
+        report.die("--list-controls needs a .grc: the control spec is built "
+                   "by the headless transform, and a .py that is already "
+                   "generated has no record of the widgets it came from.",
+                   code=EXIT_USAGE)
+    report.banner("CONTROLS")
+    if not gen.controls:
+        report.say("controls", "this flowgraph has no QT GUI input blocks, "
+                               "so there is nothing to control live")
+        return EXIT_OK
+    for c in gen.controls:
+        report.kv(c.id, _describe_control(c))
+    report.blank()
+    report.say("controls", "set one at launch with --run --set %s=<value>"
+               % gen.controls[0].id)
+    return EXIT_OK
+
+
+def _describe_control(c):
+    bits = ["%s (%s)" % (c.kind, c.dtype), "default %r" % (c.default,)]
+    if c.free_entry:
+        bits.append("free entry -- %s" % (c.note or "value not evaluable"))
+    elif c.kind == controls_mod.KIND_RANGE:
+        bits.append("%s..%s step %s" % (c.extra["start"], c.extra["stop"],
+                                        c.extra["step"]))
+    elif c.kind == controls_mod.KIND_CHOOSER:
+        bits.append("one of %s"
+                    % ", ".join(repr(o) for o in c.extra["options"]))
+    elif c.kind == controls_mod.KIND_CHECK_BOX:
+        bits.append("%r / %r" % (c.extra["true_value"],
+                                 c.extra["false_value"]))
+    elif c.kind == controls_mod.KIND_PUSH_BUTTON:
+        bits.append("pulses %r then %r" % (c.extra["pressed"],
+                                           c.extra["released"]))
+    if c.label and c.label != c.id:
+        bits.append("labelled %r" % c.label)
+    return "; ".join(bits)
+
+
+def _resolve_sets(args, controls_by_id):
+    """--set ID=VALUE pairs, coerced against the spec. Exits on a bad one.
+
+    Coerced here rather than on the board so a typo is caught before a
+    single byte reaches the console: the board would refuse it too, but as
+    an ERR line in the middle of a live run rather than as a usage error.
+    """
+    resolved = []
+    for item in args.set_controls:
+        cid, _, text = item.partition("=")
+        cid = cid.strip()
+        control = controls_by_id.get(cid)
+        if control is None:
+            report.die(
+                "--set %s: the deployed flowgraph has no control called %r. "
+                "It has: %s" % (item, cid,
+                                ", ".join(sorted(controls_by_id)) or "(none)"),
+                code=EXIT_USAGE)
+        try:
+            resolved.append((control, controls_mod.coerce_value(control,
+                                                                text)))
+        except ControlError as exc:
+            report.die("--set %s: %s" % (item, exc), code=EXIT_USAGE)
+    return resolved
+
+
 def _prepare_payload(args):
     """Collect + build the payload, print the manifest/ETA banner. Returns
     the Payload, or exits with EXIT_USAGE on a PayloadError."""
+    # fau_ctl.py and ui_spec.json ride along as ordinary siblings when the
+    # flowgraph has controls. Named explicitly rather than found by the
+    # import scanner: the generated .py imports fau_ctl inside the injected
+    # snippet function, which an AST walk of the top level never sees.
+    gen = getattr(args, "generated", None)
+    extra = list(args.extra) + list(gen.extra_files if gen else ())
     try:
         entries, main_arc = payload.collect_files(
-            args.flowgraph, extra=args.extra, max_bytes=args.max_bytes,
+            args.flowgraph, extra=extra, max_bytes=args.max_bytes,
             search_dirs=getattr(args, "search_dirs", ()))
     except PayloadError as exc:
         report.die(str(exc), code=EXIT_USAGE)
@@ -505,6 +605,14 @@ def _shutdown_receiver(session):
 
 
 
+def _apply_sets(runner, pending):
+    for control, value in pending:
+        try:
+            report.say("control", runner.set_control(control.id, value))
+        except RunError as exc:
+            report.warn(str(exc))
+
+
 def _run_flowgraph(session, transport, reader, args, main_name):
     """Run the flowgraph in the foreground and stream its output.
 
@@ -522,22 +630,40 @@ def _run_flowgraph(session, transport, reader, args, main_name):
     except ParamError as exc:
         report.die(str(exc), code=EXIT_USAGE)
 
+    gen = getattr(args, "generated", None)
+    by_id = {c.id: c for c in (gen.controls if gen else ())}
+    pending = _resolve_sets(args, by_id)
+
     r = Runner(session, transport, reader, args.dest, main_name,
-               params=tokens, sudo=not args.no_sudo)
+               params=tokens, sudo=not args.no_sudo,
+               control_ids=tuple(by_id),
+               on_control=lambda reply: report.say(
+                   "control", "%s %s %s" % (reply.kind, reply.id or "",
+                                            reply.text)))
     report.banner("RUN")
     report.say("run", r.command)
     report.say("run", "Ctrl-C stops the flowgraph (it does not abort "
                       "fau-deploy)")
+    if by_id:
+        report.say("run", "control channel: %s" % ", ".join(sorted(by_id)))
 
     stop = {"asked": False}
 
     def on_sigint(_sig, _frame):
         stop["asked"] = True
 
+    def on_line(line):
+        report.say("board", line)
+        # Applied on READY rather than after a fixed delay: READY is the
+        # board saying the dispatcher's reader thread is up, so a SET sent
+        # then cannot land before anything is listening for it.
+        if pending and "READY" in line and r.controllable:
+            _apply_sets(r, pending)
+            del pending[:]
+
     previous = signal.signal(signal.SIGINT, on_sigint)
     try:
-        result = r.run(on_line=lambda line: report.say("board", line),
-                       should_stop=lambda: stop["asked"])
+        result = r.run(on_line=on_line, should_stop=lambda: stop["asked"])
     finally:
         signal.signal(signal.SIGINT, previous)
 
@@ -546,6 +672,9 @@ def _run_flowgraph(session, transport, reader, args, main_name):
     report.kv("stopped by operator", result.terminated)
     report.kv("output lines", result.lines)
     report.kv("elapsed", "%.1fs" % result.elapsed)
+    if by_id:
+        report.kv("controls acked", result.control_acks)
+        report.kv("control errors", result.control_errors)
 
     if result.wedged:
         return EXIT_WEDGED
@@ -573,6 +702,8 @@ def main(argv=None):
     # here costs nothing, whereas failing after login leaves a session to
     # tear down for no reason.
     _process(args)
+    if args.list_controls:
+        return _print_controls(args)
     if args.process_only:
         if args.watch:
             return _watch_process(args)

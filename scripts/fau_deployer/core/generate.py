@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 
+from . import controls as controls_mod
 from . import grcfile, headless, report
 from .grcfile import GrcError
 
@@ -60,7 +61,7 @@ class Generated:
     """
 
     def __init__(self, grc_path, py_path, headless_grc, build_dir, target,
-                 transform_report, stamp):
+                 transform_report, stamp, spec_path=None):
         self.grc_path = grc_path
         self.py_path = py_path
         self.headless_grc = headless_grc
@@ -68,6 +69,31 @@ class Generated:
         self.target = target
         self.transform_report = transform_report
         self.stamp = stamp
+        self.spec_path = spec_path
+        """The ui_spec.json for this build, or None if the flowgraph has no
+        QT GUI input blocks. Its presence is what the front-ends gate the
+        control panel on -- see `extra_files`."""
+
+    @property
+    def controls(self):
+        return self.transform_report.controls if self.transform_report else []
+
+    @property
+    def extra_files(self):
+        """The non-flowgraph files that must ride along in the payload.
+
+        `fau_ctl.py` and its spec are siblings of the generated `.py` on
+        the board, not part of the image: nothing is installed, so the
+        board-side half of the control channel can be iterated as fast as
+        Deploy can be pressed. They are named explicitly here rather than
+        found by payload.py's import scanner, because the generated `.py`
+        does not import fau_ctl at module level -- the injected Snippet
+        imports it inside a function, which an AST walk of the top level
+        would never see.
+        """
+        if not self.spec_path:
+            return ()
+        return (fau_ctl_source(), self.spec_path)
 
     @property
     def source_dir(self):
@@ -156,8 +182,21 @@ def preflight(fg, expect_target=None):
     return target
 
 
+def fau_ctl_source():
+    """Path to the board-side control dispatcher in this checkout.
+
+    It ships per deploy as a payload sibling and is never installed into
+    the board image, so this is the only copy and it is always the one
+    that runs. A deployer that has been updated cannot be talking to a
+    stale board-side half.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), "board", "fau_ctl.py")
+
+
 def process(grc_path, expect_target=None, allow_message_controls=False,
-            build_dir=None, grcc=GRCC_DEFAULT, dry_run=False):
+            build_dir=None, grcc=GRCC_DEFAULT, dry_run=False,
+            enable_controls=True):
     """Ingest, check, transform and generate. Returns a Generated.
 
     With `dry_run`, everything up to and including writing the derived
@@ -174,7 +213,8 @@ def process(grc_path, expect_target=None, allow_message_controls=False,
     target = preflight(fg, expect_target)
 
     doc, transform_report = headless.transform(
-        fg, allow_message_controls=allow_message_controls)
+        fg, allow_message_controls=allow_message_controls,
+        enable_controls=enable_controls)
 
     build = build_dir or build_dir_for(grc_path)
     os.makedirs(build, exist_ok=True)
@@ -186,16 +226,43 @@ def process(grc_path, expect_target=None, allow_message_controls=False,
     headless.write(doc, derived)
     report.kv("derived .grc", derived)
 
+    spec_path = _write_spec(build, fg, transform_report)
+
     if dry_run:
         report.say("process", "dry run -- grcc not invoked")
         return Generated(grc_path, None, derived, build, target,
-                         transform_report, stamp)
+                         transform_report, stamp, spec_path)
 
     py_path = run_grcc(derived, build, fg.flowgraph_id, grcc=grcc,
                        source_dir=os.path.dirname(grc_path))
     report.kv("generated", py_path)
     return Generated(grc_path, py_path, derived, build, target,
-                     transform_report, stamp)
+                     transform_report, stamp, spec_path)
+
+
+def _write_spec(build, fg, transform_report):
+    """Write ui_spec.json, or remove a stale one and return None.
+
+    Removing matters as much as writing: the build directory is stable
+    across regenerations, so a spec left behind after the operator deletes
+    the last slider from their flowgraph would ship a panel for controls
+    the running flowgraph no longer has. Every SET would come back ERR,
+    which reads as a broken control channel rather than as a stale file.
+    """
+    path = os.path.join(build, controls_mod.SPEC_FILENAME)
+    if not transform_report.controls:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    controls_mod.write_spec(
+        controls_mod.build_spec(fg.flowgraph_id, transform_report.controls),
+        path)
+    report.kv("control spec", "%s (%d control%s)"
+              % (path, len(transform_report.controls),
+                 "" if len(transform_report.controls) == 1 else "s"))
+    return path
 
 
 def run_grcc(grc_path, out_dir, expect_id, grcc=GRCC_DEFAULT,

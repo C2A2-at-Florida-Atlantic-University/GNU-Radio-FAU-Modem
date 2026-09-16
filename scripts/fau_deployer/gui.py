@@ -62,7 +62,8 @@ from .core.fpga import FpgaError
 from .core.params import ParamError
 from .core.payload import PayloadError
 from .core.protocol import CHUNK_B64_DEFAULT, DEST_DEFAULT, IDLE_TIMEOUT_DEFAULT
-from .core.runner import Runner
+from .controls_panel import ControlPanel
+from .core.runner import RunError, Runner
 from .core.sender import Sender, TransferError
 from .core.session import BoardSession
 from .core.transport import LineReader, SerialTransport
@@ -250,6 +251,11 @@ class App:
         # failed -- and "failed" arrives as a separate event from
         # "job_done", so the two have to be correlated by a flag.
         self.process_ok = False
+        # The live Runner, published by _job_run for the duration of a run
+        # so the UI thread's control widgets can write to it. None at every
+        # other moment, which is what makes "no run, no console write"
+        # structural rather than a rule each widget has to remember.
+        self.runner = None
 
         self.var_path = tk.StringVar()
         self.var_params = tk.StringVar()
@@ -409,7 +415,7 @@ class App:
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(5, weight=1)
+        outer.rowconfigure(6, weight=1)
 
         # -- target flowgraph
         row = ttk.Frame(outer)
@@ -464,9 +470,18 @@ class App:
         ttk.Label(box, textvariable=self.var_progress_text).grid(
             row=1, column=0, sticky="w", padx=8, pady=(0, 6))
 
+        # -- live controls, built from the deployed payload's ui_spec.json.
+        # Above the log rather than below it because it is the only part of
+        # this window an operator touches while a flowgraph is running, and
+        # the log is the part that grows.
+        self.controls_panel = ControlPanel(
+            outer, self._send_control, self._pulse_control,
+            on_message=lambda text: self._log("[ctl] %s" % text, True))
+        self.controls_panel.grid(row=5, column=0, sticky="ew", **pad)
+
         # -- log
         box = ttk.LabelFrame(outer, text="Log")
-        box.grid(row=5, column=0, sticky="nsew", **pad)
+        box.grid(row=6, column=0, sticky="nsew", **pad)
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
         # state="disabled" makes it read-only, which is right -- but on
@@ -496,7 +511,7 @@ class App:
                         inactiveselectbackground="#b8cde3")
 
         ttk.Label(outer, textvariable=self.var_status, anchor="w",
-                  relief="sunken").grid(row=6, column=0, sticky="ew")
+                  relief="sunken").grid(row=7, column=0, sticky="ew")
 
     # -------------------------------------------------------- device file
     def _load_bitstreams(self, initial=False):
@@ -925,6 +940,12 @@ class App:
                 else "disabled")
 
         on(self.btn_bitstream, idle_like and have_port and mode is not None)
+        # The gate. Writing to the console is forbidden except for a
+        # control line on a payload that declared the id -- so the panel
+        # goes live only once the board has said READY (handled above),
+        # and goes dead the instant the run is anything but RUNNING.
+        if state != RUNNING:
+            self.controls_panel.set_enabled(False)
         self._refresh_status()
 
     def _short_port(self):
@@ -1129,6 +1150,29 @@ class App:
             self.watcher.rebaseline()
             self._log("[gui] processed -> %s" % self.generated.py_path)
             self._refresh_track()
+            # Rendered at Process, not at Run: seeing the panel a flowgraph
+            # will have is useful before deploying it, and the widgets stay
+            # disabled until something is actually running.
+            self.controls_panel.set_controls(self.generated.controls)
+            self.controls_panel.set_enabled(False)
+            if self.generated.controls:
+                self._log("[gui] %d live control%s: %s"
+                          % (len(self.generated.controls),
+                             "" if len(self.generated.controls) == 1 else "s",
+                             ", ".join(c.id
+                                       for c in self.generated.controls)))
+        elif kind == "control":
+            # Routed to the widget rather than only into the log: a
+            # control that silently did not take is the failure this panel
+            # exists to prevent.
+            reply = event[1]
+            self.controls_panel.acknowledge(reply)
+            if reply.kind == "READY":
+                self.controls_panel.set_enabled(True)
+                self._log("[gui] control channel ready: %s" % reply.text)
+            elif not reply.ok:
+                self._log("[board] control %s: %s" % (reply.id, reply.text),
+                          True)
         elif kind == "failed":
             self._log("  %s failed -- %s" % (event[1], event[2]), True)
         elif kind == "job_done":
@@ -1202,15 +1246,19 @@ class App:
         """
         path = self._path()
         if not self._is_grc():
-            return path, ()
+            return path, (), ()
         gen = self._fresh_generated()
         if gen is None:
             messagebox.showerror(
                 "Not processed",
                 "%s has not been turned into Python yet. Press Process."
                 % os.path.basename(path), parent=self.root)
-            return None, ()
-        return gen.py_path, (gen.source_dir,)
+            return None, (), ()
+        # fau_ctl.py and ui_spec.json ride along when the flowgraph has
+        # controls. Named rather than discovered: the generated .py imports
+        # fau_ctl inside the injected snippet, which payload.py's top-level
+        # AST walk never sees.
+        return gen.py_path, (gen.source_dir,), gen.extra_files
 
     def _guard(self):
         """Common preconditions for anything that talks to the board."""
@@ -1250,7 +1298,7 @@ class App:
             self._start_process(after="deploy")
             return
 
-        source, search_dirs = self._deploy_source()
+        source, search_dirs, extra = self._deploy_source()
         if source is None:
             return
 
@@ -1260,7 +1308,7 @@ class App:
         settings = self._settings()
         try:
             entries, main_arc = payload.collect_files(
-                source, search_dirs=search_dirs)
+                source, extra=extra, search_dirs=search_dirs)
             pl = payload.build_payload(entries, main_arc,
                                        chunk_size=CHUNK_B64_DEFAULT)
         except PayloadError as exc:
@@ -1296,7 +1344,7 @@ class App:
             self._start_process(after="run")
             return
 
-        path, _search = self._deploy_source()
+        path, _search, _extra = self._deploy_source()
         if path is None:
             return
         try:
@@ -1315,10 +1363,17 @@ class App:
         # is the generated .py in the build directory and NOT the .grc's
         # own name -- the board has no .grc on it to run.
         main_name = os.path.basename(path)
+        # From the payload that will actually be on the board, never from
+        # the panel: a flowgraph processed but not deployed has a spec here
+        # and none there, and a SET against that run would be a line typed
+        # at the shell.
+        gen = self._fresh_generated() if self._is_grc() else None
+        control_ids = tuple(c.id for c in gen.controls) if gen else ()
         self._set_state(RUNNING)
         self.worker.submit(
             "run", lambda w: self._job_run(w, settings["dest"], main_name,
-                                           tokens, settings["sudo"]),
+                                           tokens, settings["sudo"],
+                                           control_ids),
             settings)
 
     def _do_load_bitstream(self):
@@ -1474,14 +1529,41 @@ class App:
         report.kv("elapsed", "%.1fs" % stats.elapsed)
         report.say("gui", "deployed to %s" % w.settings["dest"])
 
-    def _job_run(self, w, dest, main_name, tokens, sudo):
+    def _send_control(self, control, value):
+        """Called from the UI thread by ControlPanel.
+
+        One write of one complete line, exactly as Runner.terminate() does
+        -- safe from this thread, and never interleaved mid-line with the
+        worker's own writes because the worker does not write during a run.
+        """
+        runner = self.runner
+        if runner is None or not runner.controllable:
+            raise RunError("nothing controllable is running")
+        self._log("[ctl] %s" % runner.set_control(control.id, value))
+
+    def _pulse_control(self, control, ms):
+        runner = self.runner
+        if runner is None or not runner.controllable:
+            raise RunError("nothing controllable is running")
+        self._log("[ctl] %s" % runner.pulse_control(control.id, ms))
+
+    def _job_run(self, w, dest, main_name, tokens, sudo, control_ids=()):
         session = w.ensure_session()
         r = Runner(session, w.transport, w.reader, dest, main_name,
-                   params=tokens, sudo=sudo)
+                   params=tokens, sudo=sudo, control_ids=control_ids,
+                   on_control=lambda reply: w.emit("control", reply))
+        # Published for the UI thread's control writes. Cleared in the
+        # finally below so a widget can never write to a Runner whose run
+        # has returned -- at that point there is no foreground process and
+        # the line would be typed at the board's shell prompt.
+        self.runner = r
         report.banner("RUN")
         report.say("run", r.command)
-        result = r.run(on_line=lambda line: report.say("board", line),
-                       should_stop=lambda: w.stop_requested)
+        try:
+            result = r.run(on_line=lambda line: report.say("board", line),
+                           should_stop=lambda: w.stop_requested)
+        finally:
+            self.runner = None
         report.banner("RUN FINISHED")
         report.kv("exit status", result.rc)
         report.kv("stopped by operator", result.terminated)

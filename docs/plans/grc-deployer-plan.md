@@ -1,13 +1,162 @@
 # Plan: FAU GRC Deployer (desktop → board over UART)
 
-Status: **the whole pipeline is built (Process phase 2026-09-15); the
-live control channel is the piece currently being built.** Nothing has run
-against real hardware yet. Everything below this line is the original
+Status: **feature-complete as designed (2026-09-15): the whole pipeline
+plus the live control channel.** Nothing has run against real hardware
+yet, and the two things still unbuilt from the design below are **Gate 2**
+(enumerating the board's actual block set) and serial auto-detect. Everything below this line is the original
 design record; see the "Implementation status" sections immediately below
 for what actually exists in `scripts/fau_deployer/` today and how it
 deviates from (or confirms) this doc. Companion to the root `CLAUDE.md`
 (which covers the blocks/PetaLinux side); this doc covers the
 **desktop-side deployment tooling**.
+
+## Implementation status (2026-09-15, later) — the live control channel
+
+Built, and the pipeline is now feature-complete as designed. The section
+"Live flowgraph controls" further down is the design; this is what it
+became, and where it was wrong.
+
+New files: `core/controls.py` (the five parsers, the `ui_spec.json` shape,
+the wire format and the desktop-side value conversion),
+`board/fau_ctl.py` (the board-side dispatcher, shipped per deploy),
+`controls_panel.py` (the Tk panel), `json/schemas/ui_spec.schema.json`.
+Changed: `core/headless.py` (extract before freezing, inject the snippet),
+`core/generate.py` (write/remove the spec, name the payload sidecars),
+`core/runner.py` (control writes, `FAU-CTL` routing, the nonce stamp),
+`cli.py` (`--list-controls`, `--set`), `gui.py` (the panel and its gate).
+Both FAU `.block.yml`s lost their `callbacks:` lists, as designed.
+
+**The three open decisions are settled**: (A) the C++ setters stay -- QA and
+`apps/` use them, they are simply unreachable from a flowgraph; (B) `PULSE`
+ships in v1; (C) a control whose fields will not evaluate degrades to a
+free-entry box and reports, rather than failing the flowgraph.
+
+488 tests green, including the control channel driven end to end over a
+real pty into a real foreground process running the real `fau_ctl.py`.
+**Still nothing run on a board.**
+
+### The snippet body must say `self`, not `tb`
+
+The design's draft snippet was `import fau_ctl` / `fau_ctl.start(tb)`.
+**That raises `NameError` the instant the flowgraph starts.** A snippet is
+emitted as the body of
+
+    def snipfcn_<name>(self):
+
+and called as `snipfcn_<name>(tb)` from `snippets_main_after_start(tb)`
+(`grc/core/FlowGraph.py:116-117`). The top block therefore arrives bound to
+`self`; `tb` is only the caller's name for it, and it is a local of
+`main()`, not a global. GRC's own Snippet documentation says as much ("to
+reference a block, it should be identified as `self.block`").
+
+Caught by reading the `.py` grcc produced rather than by inspection, which
+is the general lesson: the transform's output is cheap to generate and
+cheap to read, and every claim about what grcc emits should be checked
+against one. `tests/test_fau_ctl.py::TestGeneratedSnippet` now runs the
+dispatcher through the emitted snippet text and pins the `tb` form as a
+failure, so this cannot come back.
+
+### The run nonce travels in a file, not an environment variable
+
+`fau_ctl` needs the run's nonce to tag its replies, and there is no
+reliable way to hand an environment variable through `sudo`: it scrubs the
+environment, and both `sudo VAR=v cmd` and `--preserve-env=VAR` require a
+sudoers privilege (SETENV / `env_keep`) this tool cannot assume is granted.
+So `build_command()` prepends `printf <nonce> > .fau_ctl_nonce && ` when --
+and only when -- the run has controls, and `fau_ctl.load_nonce()` reads it
+from beside its own `__file__`. A directory the deploy just wrote to needs
+no privilege at all.
+
+Chained with `&&` like the `cd`, so a nonce that cannot be written stops
+the run rather than starting a flowgraph whose replies nothing can match.
+A missing or malformed nonce file falls back to `000000` rather than
+refusing to start: losing reply routing is cosmetic, refusing to run is
+not. The file is only added to the command when controls exist, so a run
+without them produces byte-for-byte the command it always did.
+
+### `fau_ctl.py` must be imported from the deploy directory
+
+`load_controls()` looks for `ui_spec.json` beside `fau_ctl.py`'s own file.
+That is right on the board -- both are payload siblings in the deploy
+directory, and the flowgraph runs with that directory as `sys.path[0]` --
+but it means a test that puts the repo's copy on `sys.path` finds no spec
+and silently starts no control channel. Which is what the first run of
+`test_runner.py::TestControlChannel` did. The test now imports the
+deployed copy, like the board.
+
+### The console echoes every line we write
+
+The board's tty echoes what is written to it, so each `SET` comes back as
+apparent flowgraph output. Without a filter a dragged slider fills the log
+with its own traffic. `controls.is_control_echo()` matches on the verb plus
+a known id rather than on the exact text sent, because the console corrupts
+a character now and then and a garbled echo logged as board output is more
+confusing than a dropped one.
+
+### The payload sidecars have to be named, not discovered
+
+`payload.py` finds a flowgraph's siblings by walking its imports with
+`ast`. The generated `.py` imports `fau_ctl` **inside** the injected
+snippet function, which a walk of the top level never sees -- so
+`Generated.extra_files` names `fau_ctl.py` and `ui_spec.json` explicitly.
+Same class of bug as the `search_dirs` one in the Process phase: the
+transfer succeeds and the board dies on `ImportError`, which looks like
+success.
+
+### A stale `ui_spec.json` is worse than none
+
+The build directory is stable across regenerations, so a spec left behind
+after the operator deletes the last slider from their flowgraph would ship
+a panel for controls the running flowgraph no longer has, and every `SET`
+would come back `ERR` -- reading as a broken control channel rather than as
+a stale file. `_write_spec()` therefore **removes** the file when a
+flowgraph has no controls, and returns None.
+
+### The status column cannot hold an error
+
+Each widget has a ~22-character status label, which is right for a value
+and useless for "set_gain(1.0) raised ValueError: ...". The widget gets the
+marker (red, truncated) and the log gets the sentence, via an `on_message`
+callback. A truncated explanation is barely better than none.
+
+### Smaller decisions worth not re-deriving
+
+- **Engineering notation applies to an Entry and not to a Range.** The
+  Entry block's stock `conv` really is `eng_notation.str_to_num`, so "1.5M"
+  must mean 1.5e6 there; a Range is numeric input from a slider or spinbox,
+  and reading "1m" off one as a milli-unit would be a surprise GRC does not
+  spring either. `controls.str_to_num` mirrors the twelve SI constants
+  rather than importing gnuradio into a Tk process, and a test checks the
+  two agree wherever gnuradio is importable.
+- **A `raw` control is parsed with `literal_eval` where stock GRC uses
+  `eval`.** A deliberate divergence, on both ends. It costs `raw` entries
+  holding a real expression; it buys that nothing typed, and nothing
+  arriving corrupted off a shared serial line, can execute.
+- **Values are restricted to what survives BOTH a JSON and a
+  `repr`/`literal_eval` round trip.** A tuple is the realistic exclusion:
+  JSON hands it back as a list, which would never compare equal to the
+  chooser option the flowgraph holds. Such a control degrades to free entry
+  and says so.
+- **Slider values are coalesced at ~15 Hz, and a release flushes
+  immediately.** The point is not bandwidth -- 30 bytes at 15 Hz is well
+  under 1 KB/s against an 11.5 KB/s console -- but keeping the log readable
+  and not hammering a setter hundreds of times for one gesture. Flushing on
+  `<ButtonRelease-1>` is what guarantees the value the operator actually
+  chose is the one that lands.
+- **A PULSE holds on the board, blocking the dispatcher for its duration.**
+  That is the feature: a value landing between the press and the release
+  would make the edge mean nothing.
+- **The panel renders at Process, not at Run**, disabled. Seeing what a
+  flowgraph will offer is useful before deploying it, and the widgets stay
+  dead until the board sends `READY`.
+- **`Runner._running` closes the write gate in a `finally`.** Once `run()`
+  returns there is no foreground process, so a late write from the UI
+  thread would be typed at the board's shell prompt. `gui.py` clears
+  `self.runner` in a `finally` for the same reason.
+- A Range whose value sits outside its own start/stop (which GRC's own
+  assert would have refused, so: a hand-edited `.grc`) has the *widget*
+  clamped and reported. The flowgraph still starts at the original value;
+  only the slider differs, until it is moved.
 
 ## Implementation status (2026-09-15) — the Process phase, live tracking, copyable log
 
@@ -589,14 +738,18 @@ Core changes it forced, all small and all used by the CLI too:
 mainloop, window withdrawn).
 
 
-## Live flowgraph controls: QT GUI inputs on the deployer (2026-09-15, design only)
+## Live flowgraph controls: QT GUI inputs on the deployer (2026-09-15, design)
 
-**Nothing in this section is built.** It is the design for rendering a
-flowgraph's **QT GUI input blocks** as widgets in the deployer and pushing
-their values to the flowgraph running on the board, over the same serial
-console everything else uses. It depends on the Process phase (still
-unbuilt) and should be built immediately after it, because the transform is
-where most of it lives.
+**This is the design; it is now built** -- see "Implementation status
+(2026-09-15, later)" above for what it became and the four places it was
+wrong (the snippet must bind `self` not `tb`, the nonce cannot travel
+through `sudo` in the environment, the tty echoes our own writes back, and
+the payload sidecars have to be named rather than discovered). Kept as
+written because the reasoning behind each decision is the part worth
+having. It is the design for rendering a flowgraph's **QT GUI input
+blocks** as widgets in the deployer and pushing their values to the
+flowgraph running on the board, over the same serial console everything
+else uses.
 
 **Scope is the five variable-defining input blocks and nothing else:**
 
@@ -928,7 +1081,7 @@ The CLI gets the read-only half: `--list-controls` prints the spec, and
 `--set id=value` applies initial values at launch. Live control from the CLI
 is not planned -- that is what the GUI is for.
 
-### Build order
+### Build order — followed as written, all six done
 
 1. Process phase (prerequisite -- `.grc` ingest, preflight, transform, grcc).
 2. The two `callbacks:` deletions in the FAU block ymls. Stands alone;
@@ -942,16 +1095,23 @@ is not planned -- that is what the GUI is for.
 5. `Runner` control writes + `FAU-CTL` routing; the payload gate.
 6. The Tk panel.
 
-### Open decisions for this feature
+Step 4's insistence on a real pty earned its keep twice: it is what caught
+the snippet's `tb`/`self` binding and the deploy-directory import.
 
-- **A.** Do the C++ setters on `fau_source`/`fau_sink` stay once the
-  `callbacks:` are gone? Recommendation: yes -- QA and `apps/` use them.
-- **B.** Does `PULSE` belong in v1, or is faithful press/release enough until
-  something actually needs a deterministic edge?
-- **C.** Should the Process phase refuse a flowgraph whose QT GUI inputs it
-  cannot fully evaluate, or degrade to free-entry boxes and report?
-  Recommendation: degrade and report, consistent with how the rest of the
-  transform treats a lossy conversion.
+### Open decisions for this feature — all three settled
+
+- **A. Settled: yes, the C++ setters stay.** QA and `apps/` use them; they
+  are simply unreachable from any flowgraph now that the `callbacks:` are
+  gone.
+- **B. Settled: `PULSE` ships in v1** (user's call). A Push Button sends
+  `PULSE <id> <ms>` and the board does pressed -> sleep -> released
+  locally, so the edge width does not depend on the link. Faithful
+  press/release stays available as the panel's `Hold` button, for
+  hold-to-enable.
+- **C. Settled: degrade and report**, as recommended -- consistent with how
+  the rest of the transform treats a lossy conversion, and carried
+  per-control so one unevaluable bound does not cost the operator every
+  other slider.
 
 
 Original status line below ("design agreed, not yet implemented") is

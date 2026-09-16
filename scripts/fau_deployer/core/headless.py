@@ -43,6 +43,7 @@ see FORCED_RUN_OPTIONS below.
 import copy
 import os
 
+from . import controls as controls_mod
 from . import grcfile, report
 from .grcfile import GrcError
 
@@ -139,6 +140,31 @@ FORCED_RUN_OPTIONS = "run"
 
 NULL_SINK_ID = "blocks_null_sink"
 VARIABLE_ID = "variable"
+SNIPPET_ID = "snippet"
+
+# The two lines that turn a frozen flowgraph back into a controllable one.
+# Deliberately two: `fau_ctl` resolves everything by name at runtime
+# (`getattr(tb, "set_" + id)`), so there is no generated mapping table and
+# nothing in the .py knows the control channel exists beyond this. Logic
+# kept out of generated code on purpose -- generated code cannot be unit
+# tested, reads badly in a traceback, and needs a re-transform to change.
+CTL_SNIPPET_NAME = "fau_ctl_snippet"
+CTL_SNIPPET_SECTION = "main_after_start"
+
+# `self`, NOT `tb`. A snippet body is emitted as the body of
+#
+#     def snipfcn_<name>(self):
+#
+# and called as `snipfcn_<name>(tb)` from `snippets_main_after_start(tb)`
+# (grc/core/FlowGraph.py:116-117). So the top block arrives bound to the
+# parameter `self`; `tb` is only the caller's name for it and is a local
+# of main(), not a global. Writing `fau_ctl.start(tb)` -- which is what the
+# plan doc's draft said -- generates code that compiles fine and raises
+# NameError the instant the flowgraph starts on the board. GRC's own
+# Snippet documentation says the same thing ("to reference a block, it
+# should be identified as self.block"); this cost one grcc run to find and
+# would have cost a board round trip to find later.
+CTL_SNIPPET_CODE = "import fau_ctl\nfau_ctl.start(self)"
 
 
 class Change:
@@ -162,6 +188,15 @@ class TransformReport:
     def __init__(self):
         self.changes = []
         self.warnings = []
+        self.controls = []
+        """The QT GUI input blocks found, as core/controls.Control.
+
+        Carried on the report rather than returned alongside the document
+        so that adding it did not change transform()'s arity. They are
+        read off the ORIGINAL blocks, before the freeze destroys their
+        bounds and labels -- which is the whole reason the spec file
+        exists.
+        """
 
     def change(self, kind, block, detail):
         self.changes.append(Change(kind, block, detail))
@@ -266,11 +301,18 @@ def _unique_name(taken, stem):
     return name
 
 
-def transform(fg, allow_message_controls=False):
+def transform(fg, allow_message_controls=False, enable_controls=True):
     """Return (headless_doc, TransformReport) for the Flowgraph `fg`.
 
     `fg` is not modified: the document is deep-copied first, so the caller's
     parsed flowgraph -- and the file behind it -- stay exactly as read.
+
+    With `enable_controls`, the QT GUI input blocks are read into
+    `report.controls` *before* they are frozen, and a Snippet is injected
+    that starts the board-side control channel. Extraction has to come
+    first: the freeze replaces the block's whole parameter dict with a
+    single `value`, so a slider's bounds are gone by the time
+    _strip_and_freeze has run.
     """
     doc = copy.deepcopy(fg.doc)
     work = grcfile.Flowgraph(doc, fg.path)
@@ -278,13 +320,77 @@ def transform(fg, allow_message_controls=False):
 
     _force_options(work, rep)
     blocked = _check_message_controls(work, rep, allow_message_controls)
+    if enable_controls:
+        _extract_controls(work, rep)
     removed = _strip_and_freeze(work, rep, blocked)
     _splice_null_sinks(work, rep, removed)
     _flag_throttles(work, rep)
+    if enable_controls and rep.controls:
+        _inject_control_snippet(work, rep)
 
     doc["blocks"] = [b.raw for b in work.blocks]
     doc["connections"] = [c.as_list() for c in work.connections]
     return doc, rep
+
+
+def _extract_controls(fg, rep):
+    """Read the five QT GUI input blocks into rep.controls.
+
+    Runs before the freeze, and only reads -- core/controls.py is a parser,
+    not a mutator, so a flowgraph whose controls cannot be understood still
+    transforms and still deploys. It just deploys without a panel for the
+    ones it could not read, each of which says why.
+    """
+    found, warnings = controls_mod.extract(fg)
+    rep.controls = found
+    for text in warnings:
+        rep.warn(text)
+
+
+def _inject_control_snippet(fg, rep):
+    """Add the Snippet that starts fau_ctl on the board.
+
+    A Snippet, not an Embedded Python Block: an epy_block is a
+    gr.basic_block with no reference to the top block and no supported way
+    to get one, so it could never call tb.set_<id>(). `main_after_start` is
+    handed `tb` by grcc's own template.
+
+    Appended last, at the default priority. Snippets in a section are
+    emitted in DESCENDING priority (`FlowGraph.get_snippets_dict`), and
+    Python's sort is stable, so among the priority-0 snippets the one added
+    last is called last -- which is what we want, since `fau_ctl.start()`
+    re-installs SIGINT and should be the install that sticks. Beating the
+    grcc template's own `signal.signal` is not in question either way: the
+    template emits that before `snippets_main_after_start` regardless.
+    """
+    existing = {b.name for b in fg.blocks}
+    name = _unique_name(set(existing), CTL_SNIPPET_NAME)
+    fg.blocks.append(grcfile.Block({
+        "name": name,
+        "id": SNIPPET_ID,
+        "parameters": {
+            "alias": "",
+            "code": CTL_SNIPPET_CODE,
+            "comment": "injected by fau_deployer: starts the live control "
+                       "channel that drives this flowgraph's frozen "
+                       "variables from the deployer",
+            "priority": "0",
+            "section": CTL_SNIPPET_SECTION,
+        },
+        "states": {
+            "bus_sink": False,
+            "bus_source": False,
+            "bus_structure": None,
+            "coordinate": [8, 8],
+            "rotation": 0,
+            "state": "enabled",
+        },
+    }))
+    rep.change("control", name,
+               "snippet at %s starting fau_ctl for %d control%s: %s"
+               % (CTL_SNIPPET_SECTION, len(rep.controls),
+                  "" if len(rep.controls) == 1 else "s",
+                  ", ".join(c.id for c in rep.controls)))
 
 
 def _force_options(fg, rep):
@@ -381,7 +487,7 @@ def _strip_and_freeze(fg, rep, blocked):
             continue
 
         if kind == "variable":
-            _freeze(b, rep)
+            _freeze(b, rep, live=any(c.id == b.name for c in rep.controls))
             kept.append(b)
             continue
 
@@ -402,21 +508,33 @@ def _strip_and_freeze(fg, rep, blocked):
     return removed
 
 
-def _freeze(block, rep, note=""):
-    """Replace a GUI control with a plain `variable` at its current value."""
+def _freeze(block, rep, note="", live=False):
+    """Replace a GUI control with a plain `variable` at its current value.
+
+    `live` says this one was also captured into the control spec, so the
+    deployer will render a widget for it and drive it over the console.
+    The generated code is identical either way -- grcc emits set_<id> for
+    every variable regardless -- but "frozen" is a misleading word to leave
+    in the derived .grc for a control that is still adjustable, and that
+    file is the thing an operator opens when a run behaves oddly.
+    """
     value = block.param("value", "0")
     label = block.param("label") or block.name
     was = block.id
     block.raw["id"] = VARIABLE_ID
     block.id = VARIABLE_ID
     block.raw["parameters"] = {
-        "comment": "frozen by fau_deployer: was %s (%s), operator-adjustable"
-                   % (was, label),
+        "comment": ("converted by fau_deployer: was %s (%s); still "
+                    "adjustable live from the deployer's control panel"
+                    if live else
+                    "frozen by fau_deployer: was %s (%s), no longer "
+                    "operator-adjustable") % (was, label),
         "value": value,
     }
     block.parameters = block.raw["parameters"]
     rep.change("froze", block.name,
-               "%s -> variable = %s%s" % (was, value, note))
+               "%s -> variable = %s%s%s"
+               % (was, value, " (live control)" if live else "", note))
 
 
 def _splice_null_sinks(fg, rep, removed):
