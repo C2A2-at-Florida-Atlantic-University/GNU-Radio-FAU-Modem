@@ -29,15 +29,23 @@ and no board knowledge. It owns exactly three things the CLI does not need:
 
 3. **A log pane.** core/report.py's output is redirected into it with
    report.set_sink() so board output, progress and diagnostics land
-   somewhere visible instead of on a stdout nobody is looking at.
+   somewhere visible instead of on a stdout nobody is looking at. It is
+   read-only but fully selectable and copyable -- a board traceback is
+   something you paste into a bug report, not something you retype.
+
+4. **A file watcher.** The flowgraph is authored in GRC, in another window,
+   and the failure this exists to prevent is deploying the .py that came
+   out of the save before last. core/watch.py polls the selected file and
+   the tool either regenerates or says out loud that it is out of date.
 
 Tkinter rather than Qt or GTK: the deployer is stdlib-only apart from
 pyserial (stdlib unittest, bare print, no logging module), and a plain form
 like this one is not what a heavier toolkit buys you.
 
-Process (.grc -> preflight -> headless transform -> grcc) is a visible
-disabled placeholder: none of that exists in core yet. See
-docs/plans/grc-deployer-plan.md.
+Selecting a .grc is the normal case: Deploy and Run both run the Process
+phase (core/generate.py) for you, and re-run it whenever the file changes,
+so what reaches the board is always generated from the flowgraph as it is
+now. Selecting an already-generated .py still works and skips all of that.
 """
 
 import glob
@@ -47,23 +55,25 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .core import boards as boards_mod, bootstrap, fpga
-from .core import params as params_mod, payload, report
+from .core import boards as boards_mod, bootstrap, fpga, generate
+from .core import params as params_mod, payload, report, watch
 from .core.boards import BoardsError
 from .core.fpga import FpgaError
 from .core.params import ParamError
 from .core.payload import PayloadError
 from .core.protocol import CHUNK_B64_DEFAULT, DEST_DEFAULT, IDLE_TIMEOUT_DEFAULT
-from .core.runner import Runner
+from .controls_panel import ControlPanel
+from .core.runner import RunError, Runner
 from .core.sender import Sender, TransferError
 from .core.session import BoardSession
 from .core.transport import LineReader, SerialTransport
 
-# LoginError/BootstrapError/TransportError are deliberately NOT imported to
-# be caught individually: _Worker.run()'s blanket handler reports any
-# exception as "<Type>: <message>", and these all carry messages already
-# written to be shown to an operator as-is. Adding per-type handlers here
-# would only restate them.
+# LoginError/BootstrapError/TransportError -- and GrcError/GenerateError
+# from the Process phase -- are deliberately NOT imported to be caught
+# individually: _Worker.run()'s blanket handler reports any exception as
+# "<Type>: <message>", and these all carry messages already written to be
+# shown to an operator as-is. Adding per-type handlers here would only
+# restate them.
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RECEIVER_PATH = os.path.join(_HERE, "board", "receiver.py")
@@ -71,6 +81,12 @@ RECEIVER_PATH = os.path.join(_HERE, "board", "receiver.py")
 TITLE = "FAU Modem GNU Radio Flowgraph Deployment Tool"
 ETA_CONFIRM_SECONDS = 60.0
 LOG_MAX_LINES = 5000
+
+# How often the selected flowgraph is stat()ed. A second is imperceptible
+# next to a transfer measured in tens of seconds, and core/watch.py waits
+# for the file to stop moving before it calls a save a change, so a poll
+# landing in the middle of GRC's write does not produce a half-read file.
+WATCH_INTERVAL_MS = 1000
 
 # --- states -----------------------------------------------------------------
 # WEDGED is sticky and deliberately has no path back except reconnecting:
@@ -84,6 +100,11 @@ DEPLOYING = "deploying"  # cancellable transfer
 RUNNING = "running"      # flowgraph live on the console
 STOPPING = "stopping"    # Ctrl-C sent, waiting for the halt to confirm
 WEDGED = "wedged"
+# Process runs grcc, which is a local subprocess and never touches the
+# console -- but it still goes through the worker, because "regenerate,
+# then deploy what was regenerated" has to stay in that order and the
+# worker queue is the thing that already guarantees it.
+PROCESSING = "processing"
 
 
 class _Worker(threading.Thread):
@@ -215,8 +236,30 @@ class App:
         # written to disk -- credentials.json is for anything durable.
         self.cred_overrides = {}
 
+        # The Process phase's last result, or None. Holds the generated
+        # .py, the derived .headless.grc and the stamp of the .grc it came
+        # from, so "is what we are about to ship still current" is a
+        # question with an answer rather than a hope.
+        self.generated = None
+        self.watcher = watch.Watcher()
+        # What to do once a queued Process finishes: None, "deploy" or
+        # "run". Set by the UI thread before submitting, consumed when the
+        # "processed" event comes back.
+        self.after_process = None
+        # Whether the last Process actually produced something. A chained
+        # Deploy must not fire off a stale .py because code generation
+        # failed -- and "failed" arrives as a separate event from
+        # "job_done", so the two have to be correlated by a flag.
+        self.process_ok = False
+        # The live Runner, published by _job_run for the duration of a run
+        # so the UI thread's control widgets can write to it. None at every
+        # other moment, which is what makes "no run, no console write"
+        # structural rather than a rule each widget has to remember.
+        self.runner = None
+
         self.var_path = tk.StringVar()
         self.var_params = tk.StringVar()
+        self.var_track = tk.StringVar(value="no flowgraph selected")
         self.var_board = tk.StringVar()
         self.var_mode = tk.StringVar()
         self.var_port_override = tk.StringVar(value="")
@@ -228,14 +271,32 @@ class App:
         # On by default: the blocks open /dev/mem and lock under /run/lock,
         # so a non-root run dies in the block constructor.
         self.var_sudo = tk.BooleanVar(value=True)
+        # On by default: regenerating costs a second of local CPU, and the
+        # thing it prevents -- deploying the previous save -- costs a whole
+        # transfer plus a run before it is even noticed.
+        self.var_autoprocess = tk.BooleanVar(value=True)
+        # Off by default, and deliberately: a GUI control that sends
+        # messages has no headless equivalent, so proceeding is a decision
+        # about what the flowgraph does. See core/headless.py.
+        self.var_allow_msg = tk.BooleanVar(value=False)
+        # Follow the tail of the log. Turned off automatically the moment
+        # the operator scrolls up, so reading or selecting older output is
+        # not fought by every incoming line.
+        self.var_follow = tk.BooleanVar(value=True)
 
         self._build_menus()
         self._build_body()
         self._load_bitstreams(initial=True)
         self._set_state(OFFLINE)
 
+        # Any route to a new path -- Browse, typing, a menu -- lands here,
+        # so there is no way to change the selection without the watcher
+        # and the generated-artifact state being brought along.
+        self.var_path.trace_add("write", lambda *_a: self._on_path_changed())
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._drain_events)
+        self.root.after(WATCH_INTERVAL_MS, self._tick_watch)
 
     # ---------------------------------------------------------------- menus
     def _build_menus(self):
@@ -249,6 +310,35 @@ class App:
 
         self.menu_port = tk.Menu(bar, tearoff=0)
         bar.add_cascade(label="Port", menu=self.menu_port)
+
+        flow = tk.Menu(bar, tearoff=0)
+        flow.add_command(label="Process now", command=self._on_process)
+        flow.add_checkbutton(label="Re-process when the .grc changes",
+                             variable=self.var_autoprocess)
+        flow.add_checkbutton(label="Allow GUI controls that send messages",
+                             variable=self.var_allow_msg)
+        flow.add_separator()
+        flow.add_command(label="Show the headless copy",
+                         command=self._show_headless)
+        flow.add_command(label="Show the generated Python",
+                         command=self._show_generated)
+        bar.add_cascade(label="Flowgraph", menu=flow)
+        self.menu_flow = flow
+
+        log = tk.Menu(bar, tearoff=0)
+        log.add_command(label="Copy", accelerator="Ctrl+C",
+                        command=self._copy_selection)
+        log.add_command(label="Select all", accelerator="Ctrl+A",
+                        command=self._select_all)
+        log.add_command(label="Copy everything", command=self._copy_all)
+        log.add_separator()
+        log.add_checkbutton(label="Follow new output",
+                            variable=self.var_follow,
+                            command=self._on_follow_toggled)
+        log.add_separator()
+        log.add_command(label="Save log as...", command=self._save_log)
+        log.add_command(label="Clear log", command=self._clear_log)
+        bar.add_cascade(label="Log", menu=log)
 
         about = tk.Menu(bar, tearoff=0)
         about.add_command(label="About...", command=self._show_about)
@@ -325,7 +415,7 @@ class App:
         outer = ttk.Frame(self.root)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(4, weight=1)
+        outer.rowconfigure(6, weight=1)
 
         # -- target flowgraph
         row = ttk.Frame(outer)
@@ -338,9 +428,17 @@ class App:
                                      command=self._browse)
         self.btn_browse.grid(row=0, column=2)
 
+        # -- what the watcher and the last Process have to say about it.
+        # Its own line rather than a corner of the status bar: "the file
+        # you are looking at is not the file you are about to send" is the
+        # single most expensive thing to miss here.
+        self.lbl_track = ttk.Label(outer, textvariable=self.var_track,
+                                   anchor="w", foreground="#555555")
+        self.lbl_track.grid(row=1, column=0, sticky="ew", padx=8)
+
         # -- params
         row = ttk.Frame(outer)
-        row.grid(row=1, column=0, sticky="ew", **pad)
+        row.grid(row=2, column=0, sticky="ew", **pad)
         row.columnconfigure(1, weight=1)
         ttk.Label(row, text="Params").grid(row=0, column=0, sticky="w")
         self.entry_params = ttk.Entry(row, textvariable=self.var_params)
@@ -348,11 +446,11 @@ class App:
 
         # -- action buttons
         row = ttk.Frame(outer)
-        row.grid(row=2, column=0, sticky="ew", **pad)
+        row.grid(row=3, column=0, sticky="ew", **pad)
         for i in range(4):
             row.columnconfigure(i, weight=1)
-        self.btn_process = ttk.Button(row, text="Process", state="disabled",
-                                      command=self._process_placeholder)
+        self.btn_process = ttk.Button(row, text="Process",
+                                      command=self._on_process)
         self.btn_process.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.btn_deploy = ttk.Button(row, text="Deploy", command=self._on_deploy)
         self.btn_deploy.grid(row=0, column=1, sticky="ew", padx=4)
@@ -364,7 +462,7 @@ class App:
 
         # -- progress
         box = ttk.LabelFrame(outer, text="Deployment progress")
-        box.grid(row=3, column=0, sticky="ew", **pad)
+        box.grid(row=4, column=0, sticky="ew", **pad)
         box.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(box, variable=self.var_progress,
                                         maximum=100.0)
@@ -372,14 +470,32 @@ class App:
         ttk.Label(box, textvariable=self.var_progress_text).grid(
             row=1, column=0, sticky="w", padx=8, pady=(0, 6))
 
+        # -- live controls, built from the deployed payload's ui_spec.json.
+        # Above the log rather than below it because it is the only part of
+        # this window an operator touches while a flowgraph is running, and
+        # the log is the part that grows.
+        self.controls_panel = ControlPanel(
+            outer, self._send_control, self._pulse_control,
+            on_message=lambda text: self._log("[ctl] %s" % text, True))
+        self.controls_panel.grid(row=5, column=0, sticky="ew", **pad)
+
         # -- log
         box = ttk.LabelFrame(outer, text="Log")
-        box.grid(row=4, column=0, sticky="nsew", **pad)
+        box.grid(row=6, column=0, sticky="nsew", **pad)
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
+        # state="disabled" makes it read-only, which is right -- but on
+        # X11 Tk's own <Button-1> binding refuses to focus a disabled text
+        # widget, and without focus the class-level <<Copy>> never fires.
+        # Selecting worked and Ctrl-C did nothing. Hence takefocus plus the
+        # explicit focus_set and key bindings below: the widget stays
+        # read-only and becomes copyable, which are not the same property
+        # however much -state conflates them.
         self.log = tk.Text(box, height=18, wrap="none", state="disabled",
-                           font=("TkFixedFont",))
+                           font=("TkFixedFont",), takefocus=True,
+                           exportselection=True, undo=False)
         self.log.grid(row=0, column=0, sticky="nsew")
+        self._bind_log()
         ybar = ttk.Scrollbar(box, orient="vertical", command=self.log.yview)
         ybar.grid(row=0, column=1, sticky="ns")
         xbar = ttk.Scrollbar(box, orient="horizontal", command=self.log.xview)
@@ -388,9 +504,14 @@ class App:
         self.log.tag_config("err", foreground="#b00020")
         self.log.tag_config("banner", foreground="#555555")
         self.log.tag_config("gui", foreground="#00518f")
+        # Selection over a coloured tag has to stay legible: without an
+        # explicit selectforeground, an err line reads as dark red on the
+        # selection blue.
+        self.log.config(selectbackground="#2f6fb5", selectforeground="white",
+                        inactiveselectbackground="#b8cde3")
 
         ttk.Label(outer, textvariable=self.var_status, anchor="w",
-                  relief="sunken").grid(row=5, column=0, sticky="ew")
+                  relief="sunken").grid(row=7, column=0, sticky="ew")
 
     # -------------------------------------------------------- device file
     def _load_bitstreams(self, initial=False):
@@ -508,13 +629,14 @@ class App:
     # --------------------------------------------------------------- dialogs
     def _browse(self):
         chosen = filedialog.askopenfilename(
-            title="Select a generated flowgraph",
-            filetypes=[("Generated flowgraph", "*.py"),
-                       ("GRC flowgraph (needs Process)", "*.grc"),
+            title="Select a flowgraph",
+            filetypes=[("GRC flowgraph", "*.grc"),
+                       ("Generated flowgraph", "*.py"),
                        ("All files", "*")])
         if chosen:
+            # The trace on var_path does the rest: watcher, generated-state
+            # and button gating all hang off the one write.
             self.var_path.set(chosen)
-            self._set_state(self.state)
 
     def _edit_credentials(self):
         role = self.var_board.get()
@@ -593,10 +715,10 @@ class App:
         lines = [
             TITLE,
             "",
-            "Ships a generated GNU Radio flowgraph to a Zynq board over its",
-            "serial console and runs it there. The FAU Modem blocks open",
-            "/dev/mem and drive AXI DMA, so they can only execute on the",
-            "board -- authoring and code generation happen on the desktop.",
+            "Ships a GNU Radio flowgraph to a Zynq board over its serial",
+            "console and runs it there. The FAU Modem blocks open /dev/mem",
+            "and drive AXI DMA, so they can only execute on the board --",
+            "authoring and code generation happen on the desktop.",
             "",
             "Design record: docs/plans/grc-deployer-plan.md",
             "Hardware notes: CLAUDE.md",
@@ -607,19 +729,170 @@ class App:
             "Mode      : %s" % (mode or "(none)"),
             "Receiver  : %s" % RECEIVER_PATH,
             "",
-            "Process (.grc -> preflight -> headless transform -> grcc) is",
-            "not implemented yet; feed it the generated .py for now.",
+            "Select a .grc and Deploy: it is preflighted, stripped of its",
+            "GUI blocks onto a headless copy and compiled with grcc, and",
+            "re-compiled whenever the file changes on disk. An already-",
+            "generated .py is sent as it is.",
+            "",
+            "Build dir : %s" % (self.generated.build_dir if self.generated
+                                else "(nothing processed yet)"),
         ]
         messagebox.showinfo("About", "\n".join(lines), parent=self.root)
 
-    def _process_placeholder(self):
+    # --------------------------------------------------------- process phase
+    def _path(self):
+        return self.var_path.get().strip()
+
+    def _is_grc(self):
+        return generate.looks_like_grc(self._path())
+
+    def _fresh_generated(self):
+        """The current Generated if it still matches the selected .grc and
+        that .grc has not moved since -- otherwise None."""
+        gen = self.generated
+        if gen is None or gen.py_path is None:
+            return None
+        if gen.grc_path != os.path.abspath(self._path()):
+            return None
+        return None if gen.is_stale() else gen
+
+    def _on_path_changed(self):
+        """Every change of the Flowgraph field funnels through here.
+
+        Cheap enough to run per keystroke: one stat(), no parsing. It is
+        the trace on var_path, so a path set by Browse, by typing or from
+        code all behave identically -- an earlier version updated state
+        only in _browse() and typing a path left the buttons stale.
+        """
+        path = self._path()
+        self.watcher.set_path(path or None)
+        if self.generated is not None and (
+                not path or self.generated.grc_path != os.path.abspath(path)):
+            self.generated = None
+        self._refresh_track()
+        self._set_state(self.state)
+
+    def _refresh_track(self):
+        """The one-line summary under the Flowgraph field."""
+        path = self._path()
+        if not path:
+            self.var_track.set("no flowgraph selected")
+            return
+        if not os.path.isfile(path):
+            self.var_track.set("%s does not exist"
+                               % os.path.basename(path))
+            return
+        if not self._is_grc():
+            note = ("changed since you selected it -- Deploy re-reads it"
+                    if self.watcher.changed else "deployed as it is")
+            self.var_track.set("%s -- already generated Python, %s"
+                               % (os.path.basename(path), note))
+            return
+        gen = self._fresh_generated()
+        if gen is not None:
+            self.var_track.set("%s -> %s (up to date)"
+                               % (self.watcher.describe(), gen.main_name))
+        elif self.generated is not None:
+            self.var_track.set(
+                "%s -- the generated Python is out of date, Deploy will "
+                "re-process" % self.watcher.describe())
+        else:
+            self.var_track.set("%s -- not processed yet"
+                               % self.watcher.describe())
+
+    def _tick_watch(self):
+        """One watcher poll, rescheduled forever.
+
+        On Tk's loop rather than a thread: the reaction to a change is all
+        UI work, and a thread would only add a second place for the
+        selected path to change underneath it.
+        """
+        try:
+            if self.watcher.poll():
+                self._on_file_changed()
+            self._refresh_track()
+        finally:
+            self.root.after(WATCH_INTERVAL_MS, self._tick_watch)
+
+    def _on_file_changed(self):
+        name = os.path.basename(self.watcher.path or "")
+        self._log("[gui] %s changed on disk" % name)
+        if not self._is_grc():
+            # A .py is shipped verbatim, so there is nothing to regenerate
+            # -- saying so is the whole job.
+            self._log("[gui] it will be re-read from disk on the next Deploy")
+            return
+        if not self.var_autoprocess.get():
+            self._log("[gui] auto-processing is off -- press Process, or "
+                      "Deploy will do it")
+            return
+        if self.state not in (IDLE, OFFLINE):
+            # Never regenerate under a live transfer or run. The payload in
+            # flight was built from a snapshot and is unaffected, but
+            # swapping the generated file under the operator's feet while
+            # they watch a run is not a thing to do quietly.
+            self._log("[gui] busy (%s) -- will not re-process until it "
+                      "finishes" % self.state)
+            return
+        self._start_process(after=None)
+
+    def _on_process(self):
+        if not self._path():
+            messagebox.showerror("No flowgraph",
+                                 "Select a .grc first.", parent=self.root)
+            return
+        if not self._is_grc():
+            messagebox.showinfo(
+                "Nothing to process",
+                "%s is already a generated Python flowgraph -- Process turns "
+                "a .grc into one. Deploy it as it is."
+                % os.path.basename(self._path()), parent=self.root)
+            return
+        self._start_process(after=None)
+
+    def _start_process(self, after=None):
+        """Queue a Process run, optionally chaining Deploy or Run after it.
+
+        Process is local (grcc in a subprocess, no console), but it goes on
+        the worker queue anyway so that "regenerate, then send what was
+        regenerated" cannot interleave with anything else.
+        """
+        path = os.path.abspath(self._path())
+        self.after_process = after
+        self.process_ok = False
+        expect = self.current_mode
+        allow = bool(self.var_allow_msg.get())
+        self._set_state(PROCESSING)
+        self.worker.submit(
+            "process",
+            lambda w: self._job_process(w, path, expect, allow),
+            self._settings())
+
+    def _show_headless(self):
+        self._reveal(self.generated.headless_grc if self.generated else None,
+                     "headless copy")
+
+    def _show_generated(self):
+        self._reveal(self.generated.py_path if self.generated else None,
+                     "generated Python")
+
+    def _reveal(self, path, what):
+        """Say where a build artifact is, rather than opening it.
+
+        Not a launcher: there is no portable way to open an editor here,
+        and the thing an operator actually wants is the path to paste into
+        the one they already have open.
+        """
+        if not path:
+            messagebox.showinfo(
+                "Nothing to show",
+                "No %s yet -- process a .grc first." % what, parent=self.root)
+            return
+        self._log("[gui] %s: %s" % (what, path))
         messagebox.showinfo(
-            "Process",
-            "Not implemented yet.\n\n"
-            "This will ingest a .grc, run the preflight gates, strip the GUI "
-            "blocks into a headless copy and call grcc to generate the .py.\n\n"
-            "Until then, generate it yourself (grcc -o DIR flowgraph.grc) and "
-            "select the resulting .py.",
+            "Build artifact",
+            "%s:\n\n%s\n\nThe path is in the log too, where it can be "
+            "selected and copied." % (what.capitalize(), path),
             parent=self.root)
 
     # ----------------------------------------------------------------- state
@@ -636,6 +909,15 @@ class App:
         on(self.entry_path, idle_like)
         on(self.entry_params, state in (IDLE, OFFLINE, RUNNING))
         on(self.btn_browse, idle_like)
+
+        # Process is local, so it does not need a port -- only a .grc.
+        if state == PROCESSING:
+            self.btn_process.config(text="Processing...", state="disabled")
+        else:
+            self.btn_process.config(
+                text="Process",
+                state="normal" if (idle_like and have_path and self._is_grc())
+                else "disabled")
 
         # Deploy doubles as Cancel mid-transfer -- one button, because the
         # two are never both meaningful.
@@ -658,6 +940,12 @@ class App:
                 else "disabled")
 
         on(self.btn_bitstream, idle_like and have_port and mode is not None)
+        # The gate. Writing to the console is forbidden except for a
+        # control line on a payload that declared the id -- so the panel
+        # goes live only once the board has said READY (handled above),
+        # and goes dead the instant the run is anything but RUNNING.
+        if state != RUNNING:
+            self.controls_panel.set_enabled(False)
         self._refresh_status()
 
     def _short_port(self):
@@ -673,6 +961,7 @@ class App:
             return os.path.basename(port)
 
     def _refresh_status(self):
+        self._refresh_track()
         board = self.current_board
         mode = self.current_mode
         bits = [
@@ -685,6 +974,123 @@ class App:
         self.var_status.set("   |   ".join(bits))
 
     # ------------------------------------------------------------------- log
+    def _bind_log(self):
+        """Make the read-only log pane focusable, copyable and scrollable
+        without the incoming stream fighting the operator.
+
+        Tk conflates "not editable" with "not interactive": a -state
+        disabled text widget still selects under the mouse, but Tk's own
+        <Button-1> binding will not give it focus, so the class-level
+        <<Copy>> binding never fires and Ctrl-C silently does nothing.
+        Taking focus explicitly is the whole fix; the rest is the menu and
+        the accelerators an operator expects to find.
+        """
+        self.log.bind("<Button-1>", self._on_log_click, add="+")
+        self.log.bind("<<Copy>>", lambda _e: self._copy_selection() or "break")
+        self.log.bind("<Control-c>", lambda _e: self._copy_selection() or "break")
+        self.log.bind("<Control-C>", lambda _e: self._copy_selection() or "break")
+        self.log.bind("<Control-Insert>",
+                      lambda _e: self._copy_selection() or "break")
+        self.log.bind("<Control-a>", lambda _e: self._select_all() or "break")
+        self.log.bind("<Control-A>", lambda _e: self._select_all() or "break")
+        # Scrolling up is how you say "stop moving"; there is no reason to
+        # make the operator also find a checkbox for it.
+        self.log.bind("<MouseWheel>", self._on_log_scroll, add="+")
+        self.log.bind("<Button-4>", self._on_log_scroll, add="+")
+        self.log.bind("<Button-5>", self._on_log_scroll, add="+")
+        self.log.bind("<Prior>", self._on_log_scroll, add="+")
+
+        menu = tk.Menu(self.log, tearoff=0)
+        menu.add_command(label="Copy", command=self._copy_selection)
+        menu.add_command(label="Select all", command=self._select_all)
+        menu.add_command(label="Copy everything", command=self._copy_all)
+        menu.add_separator()
+        menu.add_command(label="Save log as...", command=self._save_log)
+        menu.add_command(label="Clear log", command=self._clear_log)
+        self.log_menu = menu
+        self.log.bind("<Button-3>", self._popup_log_menu)
+
+    def _on_log_click(self, _event):
+        self.log.focus_set()
+
+    def _on_log_scroll(self, _event):
+        # Called before Tk has actually scrolled, so the decision is made
+        # on the next idle tick against the view the operator ends up with.
+        self.root.after_idle(self._sync_follow)
+
+    def _sync_follow(self):
+        self.var_follow.set(self._at_bottom())
+
+    def _on_follow_toggled(self):
+        if self.var_follow.get():
+            self.log.see("end")
+
+    def _at_bottom(self):
+        try:
+            return self.log.yview()[1] > 0.999
+        except tk.TclError:
+            return True
+
+    def _selection(self):
+        """The selected text, or None. `sel.first` raises rather than
+        returning empty when there is no selection, which is why this is
+        a helper and not an inline get()."""
+        try:
+            return self.log.get("sel.first", "sel.last")
+        except tk.TclError:
+            return None
+
+    def _to_clipboard(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        # Tk serves the X selection from its own process, so the clipboard
+        # is only readable by another app while this one is alive. That is
+        # fine here (the operator pastes now, not after quitting) and there
+        # is no portable way to hand it to a clipboard manager anyway.
+
+    def _copy_selection(self):
+        text = self._selection()
+        if text is None:
+            self._log("[gui] nothing selected in the log -- drag to select, "
+                      "or use Log > Copy everything")
+            return
+        self._to_clipboard(text)
+
+    def _copy_all(self):
+        self._to_clipboard(self.log.get("1.0", "end-1c"))
+
+    def _select_all(self):
+        self.log.tag_add("sel", "1.0", "end-1c")
+        self.log.focus_set()
+
+    def _popup_log_menu(self, event):
+        self.log.focus_set()
+        try:
+            self.log_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_menu.grab_release()
+
+    def _save_log(self):
+        chosen = filedialog.asksaveasfilename(
+            title="Save the log", defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*")])
+        if not chosen:
+            return
+        try:
+            with open(chosen, "w") as fh:
+                fh.write(self.log.get("1.0", "end-1c"))
+                fh.write("\n")
+        except OSError as exc:
+            messagebox.showerror("Save log", str(exc), parent=self.root)
+            return
+        self._log("[gui] log saved to %s" % chosen)
+
+    def _clear_log(self):
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.config(state="disabled")
+        self.var_follow.set(True)
+
     def _log(self, text, is_err=False):
         tag = "err" if is_err else None
         if not is_err:
@@ -692,6 +1098,7 @@ class App:
                 tag = "banner"
             elif text.startswith("[gui]"):
                 tag = "gui"
+        follow = self.var_follow.get() and self._at_bottom()
         self.log.config(state="normal")
         self.log.insert("end", text + "\n", tag)
         # Trim from the front rather than growing without bound: a long
@@ -700,7 +1107,12 @@ class App:
         excess = int(self.log.index("end-1c").split(".")[0]) - LOG_MAX_LINES
         if excess > 0:
             self.log.delete("1.0", "%d.0" % (excess + 1))
-        self.log.see("end")
+        # Only chase the tail if we were already at it. Scrolling back to
+        # read or select something must not be undone by the next board
+        # line -- that is what made the log feel uncopyable even once the
+        # focus problem above was fixed.
+        if follow:
+            self.log.see("end")
         self.log.config(state="disabled")
 
     def _drain_events(self):
@@ -732,6 +1144,35 @@ class App:
         elif kind == "disconnected":
             self.connected = False
             self._set_state(OFFLINE)
+        elif kind == "processed":
+            self.generated = event[1]
+            self.process_ok = True
+            self.watcher.rebaseline()
+            self._log("[gui] processed -> %s" % self.generated.py_path)
+            self._refresh_track()
+            # Rendered at Process, not at Run: seeing the panel a flowgraph
+            # will have is useful before deploying it, and the widgets stay
+            # disabled until something is actually running.
+            self.controls_panel.set_controls(self.generated.controls)
+            self.controls_panel.set_enabled(False)
+            if self.generated.controls:
+                self._log("[gui] %d live control%s: %s"
+                          % (len(self.generated.controls),
+                             "" if len(self.generated.controls) == 1 else "s",
+                             ", ".join(c.id
+                                       for c in self.generated.controls)))
+        elif kind == "control":
+            # Routed to the widget rather than only into the log: a
+            # control that silently did not take is the failure this panel
+            # exists to prevent.
+            reply = event[1]
+            self.controls_panel.acknowledge(reply)
+            if reply.kind == "READY":
+                self.controls_panel.set_enabled(True)
+                self._log("[gui] control channel ready: %s" % reply.text)
+            elif not reply.ok:
+                self._log("[board] control %s: %s" % (reply.id, reply.text),
+                          True)
         elif kind == "failed":
             self._log("  %s failed -- %s" % (event[1], event[2]), True)
         elif kind == "job_done":
@@ -748,6 +1189,21 @@ class App:
             # the board until the operator has looked at it.
             if self.state != WEDGED:
                 self._set_state(IDLE if self.connected else OFFLINE)
+            # The chained half of "Deploy a .grc": the continuation runs
+            # HERE and not in the "processed" handler, because job_done is
+            # the one place that resets the state -- dispatching earlier
+            # would have the reset land on top of DEPLOYING and re-enable
+            # every button mid-transfer.
+            if event[1] == "process":
+                after, self.after_process = self.after_process, None
+                if after and self.process_ok:
+                    if after == "deploy":
+                        self._on_deploy()
+                    elif after == "run":
+                        self._on_run()
+                elif after:
+                    self._log("[gui] %s cancelled -- processing failed"
+                              % after, True)
         elif kind == "wedged":
             self._set_state(WEDGED)
             messagebox.showerror(
@@ -777,6 +1233,33 @@ class App:
             "verbose": bool(self.var_verbose.get()),
         }
 
+    def _deploy_source(self):
+        """(file to send, extra sibling-search directories), or (None, ()).
+
+        For a .grc this is the generated .py in the build directory. Its
+        siblings, though, are still beside the .grc: a flowgraph that does
+        `from fau_tx_common import ...` imports a module that GRC never
+        copied anywhere, so payload assembly has to search the source
+        directory as well or the transfer succeeds and the board fails on
+        ImportError -- the worst shape of failure, because it looks like it
+        worked.
+        """
+        path = self._path()
+        if not self._is_grc():
+            return path, (), ()
+        gen = self._fresh_generated()
+        if gen is None:
+            messagebox.showerror(
+                "Not processed",
+                "%s has not been turned into Python yet. Press Process."
+                % os.path.basename(path), parent=self.root)
+            return None, (), ()
+        # fau_ctl.py and ui_spec.json ride along when the flowgraph has
+        # controls. Named rather than discovered: the generated .py imports
+        # fau_ctl inside the injected snippet, which payload.py's top-level
+        # AST walk never sees.
+        return gen.py_path, (gen.source_dir,), gen.extra_files
+
     def _guard(self):
         """Common preconditions for anything that talks to the board."""
         if self.state == WEDGED:
@@ -805,15 +1288,18 @@ class App:
         if not self._guard():
             return
 
-        path = self.var_path.get().strip()
-        if path.endswith(".grc"):
-            messagebox.showerror(
-                "Not a generated flowgraph",
-                "%s is a GRC source file. Generating the .py from it is the "
-                "Process step, which is not implemented yet.\n\n"
-                "Run `grcc -o DIR %s` and select the .py it writes."
-                % (os.path.basename(path), os.path.basename(path)),
-                parent=self.root)
+        # A .grc that has never been processed, or whose .py is older than
+        # the file on disk, is regenerated FIRST and deployed afterwards.
+        # This is the whole point of accepting a .grc: what reaches the
+        # board is generated from the flowgraph as it stands right now.
+        if self._is_grc() and self._fresh_generated() is None:
+            self._log("[gui] the generated Python is missing or out of date "
+                      "-- processing before deploying")
+            self._start_process(after="deploy")
+            return
+
+        source, search_dirs, extra = self._deploy_source()
+        if source is None:
             return
 
         # Payload assembly is local, fast and the only thing that can ask a
@@ -821,7 +1307,8 @@ class App:
         # needs to prompt, which keeps it free of any Tk contact.
         settings = self._settings()
         try:
-            entries, main_arc = payload.collect_files(path)
+            entries, main_arc = payload.collect_files(
+                source, extra=extra, search_dirs=search_dirs)
             pl = payload.build_payload(entries, main_arc,
                                        chunk_size=CHUNK_B64_DEFAULT)
         except PayloadError as exc:
@@ -850,7 +1337,16 @@ class App:
             return
         if not self._guard():
             return
-        path = self.var_path.get().strip()
+
+        if self._is_grc() and self._fresh_generated() is None:
+            self._log("[gui] the generated Python is missing or out of date "
+                      "-- processing before running")
+            self._start_process(after="run")
+            return
+
+        path, _search, _extra = self._deploy_source()
+        if path is None:
+            return
         try:
             tokens = params_mod.check(self.var_params.get(), path)
         except ParamError as exc:
@@ -863,11 +1359,21 @@ class App:
         # flowgraph and pressing Run without deploying first silently ran
         # the previous one. Deploy derives dest the same way, so there was
         # nothing to cache anyway.
+        # Derived from the file that was actually sent, which for a .grc
+        # is the generated .py in the build directory and NOT the .grc's
+        # own name -- the board has no .grc on it to run.
         main_name = os.path.basename(path)
+        # From the payload that will actually be on the board, never from
+        # the panel: a flowgraph processed but not deployed has a spec here
+        # and none there, and a SET against that run would be a line typed
+        # at the shell.
+        gen = self._fresh_generated() if self._is_grc() else None
+        control_ids = tuple(c.id for c in gen.controls) if gen else ()
         self._set_state(RUNNING)
         self.worker.submit(
             "run", lambda w: self._job_run(w, settings["dest"], main_name,
-                                           tokens, settings["sudo"]),
+                                           tokens, settings["sudo"],
+                                           control_ids),
             settings)
 
     def _do_load_bitstream(self):
@@ -1023,14 +1529,41 @@ class App:
         report.kv("elapsed", "%.1fs" % stats.elapsed)
         report.say("gui", "deployed to %s" % w.settings["dest"])
 
-    def _job_run(self, w, dest, main_name, tokens, sudo):
+    def _send_control(self, control, value):
+        """Called from the UI thread by ControlPanel.
+
+        One write of one complete line, exactly as Runner.terminate() does
+        -- safe from this thread, and never interleaved mid-line with the
+        worker's own writes because the worker does not write during a run.
+        """
+        runner = self.runner
+        if runner is None or not runner.controllable:
+            raise RunError("nothing controllable is running")
+        self._log("[ctl] %s" % runner.set_control(control.id, value))
+
+    def _pulse_control(self, control, ms):
+        runner = self.runner
+        if runner is None or not runner.controllable:
+            raise RunError("nothing controllable is running")
+        self._log("[ctl] %s" % runner.pulse_control(control.id, ms))
+
+    def _job_run(self, w, dest, main_name, tokens, sudo, control_ids=()):
         session = w.ensure_session()
         r = Runner(session, w.transport, w.reader, dest, main_name,
-                   params=tokens, sudo=sudo)
+                   params=tokens, sudo=sudo, control_ids=control_ids,
+                   on_control=lambda reply: w.emit("control", reply))
+        # Published for the UI thread's control writes. Cleared in the
+        # finally below so a widget can never write to a Runner whose run
+        # has returned -- at that point there is no foreground process and
+        # the line would be typed at the board's shell prompt.
+        self.runner = r
         report.banner("RUN")
         report.say("run", r.command)
-        result = r.run(on_line=lambda line: report.say("board", line),
-                       should_stop=lambda: w.stop_requested)
+        try:
+            result = r.run(on_line=lambda line: report.say("board", line),
+                           should_stop=lambda: w.stop_requested)
+        finally:
+            self.runner = None
         report.banner("RUN FINISHED")
         report.kv("exit status", result.rc)
         report.kv("stopped by operator", result.terminated)
@@ -1038,6 +1571,17 @@ class App:
         report.kv("elapsed", "%.1fs" % result.elapsed)
         if result.wedged:
             w.emit("wedged")
+
+    def _job_process(self, w, path, expect_target, allow_msg):
+        """Ingest, preflight, transform and run grcc -- all local.
+
+        The one job that never opens the port: ensure_session() is
+        deliberately not called, so processing a flowgraph before a board
+        is even plugged in works, which is when most of it happens.
+        """
+        gen = generate.process(path, expect_target=expect_target,
+                               allow_message_controls=allow_msg)
+        w.emit("processed", gen)
 
     def _job_load_bitstream(self, w, steps):
         session = w.ensure_session()

@@ -26,12 +26,17 @@ import argparse
 import os
 import signal
 import sys
+import time
 
-from .core import boards as boards_mod, bootstrap, fpga
-from .core import params as params_mod, payload, report
+from .core import boards as boards_mod, bootstrap, fpga, generate
+from .core import controls as controls_mod
+from .core import params as params_mod, payload, report, watch
 from .core.boards import BoardsError
+from .core.controls import ControlError
 from .core.bootstrap import BootstrapError
 from .core.fpga import FpgaError
+from .core.generate import GenerateError
+from .core.grcfile import GrcError
 from .core.params import ParamError
 from .core.payload import PayloadError
 from .core.protocol import (
@@ -39,7 +44,7 @@ from .core.protocol import (
     DEST_DEFAULT,
     IDLE_TIMEOUT_DEFAULT,
 )
-from .core.runner import Runner
+from .core.runner import RunError, Runner
 from .core.sender import Sender, TransferError
 from .core.session import BoardSession, LoginError
 from .core.transport import LineReader, SerialTransport, Transcript, TransportError
@@ -71,12 +76,14 @@ def _build_parser():
                     "serial console.")
 
     p.add_argument("--flowgraph", metavar="PATH",
-                   help="the generated .py to deploy and/or run; its local "
-                        "sibling imports (e.g. a shared helper module next "
-                        "to it) are discovered automatically -- see --extra "
-                        "to add any this misses. Required unless the only "
-                        "action asked for is --load-bitstream or "
-                        "--list-boards")
+                   help="the flowgraph to deploy and/or run: either a .grc, "
+                        "which is preflighted, made headless and compiled "
+                        "with grcc first, or an already-generated .py, which "
+                        "is sent as it is. Local sibling imports (e.g. a "
+                        "shared helper module next to it) are discovered "
+                        "automatically -- see --extra to add any this "
+                        "misses. Required unless the only action asked for "
+                        "is --load-bitstream or --list-boards")
     p.add_argument("--extra", action="append", default=[], metavar="PATH",
                    help="an additional file to ship alongside --flowgraph; "
                         "repeatable")
@@ -222,6 +229,51 @@ def _build_parser():
                    help="build the payload and print the manifest/ETA, but "
                         "never open the serial port")
 
+    g = p.add_argument_group(
+        "process (.grc -> .py)",
+        "Only meaningful when --flowgraph names a .grc. Compiling it needs "
+        "GNU Radio on THIS machine; the board never sees a .grc.")
+    g.add_argument("--process-only", action="store_true",
+                   help="preflight, transform and compile the .grc, print "
+                        "where the .py landed, and stop. Opens no port")
+    g.add_argument("--no-process", action="store_true",
+                   help="refuse to compile: fail if --flowgraph is a .grc. "
+                        "For a CI job that wants to be sure it is shipping a "
+                        "reviewed .py and not one generated on the spot")
+    g.add_argument("--allow-message-controls", action="store_true",
+                   help="proceed even though the flowgraph has GUI controls "
+                        "that send messages. Headless nobody presses them, "
+                        "so those messages never fire -- a change in what "
+                        "the flowgraph does, which is why it is not the "
+                        "default")
+    g.add_argument("--build-dir", metavar="DIR",
+                   help="where the headless copy and the generated .py go "
+                        "(default: a per-flowgraph directory under "
+                        "$XDG_CACHE_HOME/fau_deployer/build)")
+    g.add_argument("--grcc", default=generate.GRCC_DEFAULT, metavar="EXE",
+                   help="the GRC compiler to run (default: %(default)s)")
+    g.add_argument("--transform-only", action="store_true",
+                   help="write the headless .grc and print what changed, but "
+                        "do not run grcc. The derived file is the audit "
+                        "artifact -- diff it against the original")
+    g.add_argument("--list-controls", action="store_true",
+                   help="print the flowgraph's QT GUI input controls (what "
+                        "the GUI would render as a control panel) and exit. "
+                        "Needs a .grc: the control spec is built by the "
+                        "transform.")
+    g.add_argument("--set", action="append", default=[], metavar="ID=VALUE",
+                   dest="set_controls",
+                   help="set a control to VALUE once the flowgraph is "
+                        "running. Repeatable. Applied in the order given, "
+                        "after the run starts. Live control from the CLI is "
+                        "not planned -- that is what the GUI is for.")
+    g.add_argument("--watch", action="store_true",
+                   help="with --process-only, stay running and recompile "
+                        "every time the .grc is saved. Deploying is "
+                        "deliberately NOT automatic: sending a new flowgraph "
+                        "to a board that is running one is a decision, not a "
+                        "reflex")
+
     return p
 
 
@@ -235,9 +287,22 @@ def _validate(parser, args):
         parser.error("--baud must be > 0")
     if args.max_bytes <= 0:
         parser.error("--max-bytes must be > 0")
+    if args.watch and not args.process_only:
+        parser.error("--watch only makes sense with --process-only: a watch "
+                     "that redeployed on every save would ship a flowgraph "
+                     "to a board nobody is looking at")
+    if args.process_only and args.no_process:
+        parser.error("--process-only and --no-process contradict each other")
     if args.no_deploy and not (args.run or args.load_bitstream):
         parser.error("--no-deploy leaves nothing to do -- add --run and/or "
                     "--load-bitstream")
+    if args.set_controls and not args.run:
+        parser.error("--set needs --run: a control only exists while the "
+                     "flowgraph is running, and writing to the console at "
+                     "any other time would be typing at the board's shell")
+    for item in args.set_controls:
+        if "=" not in item:
+            parser.error("--set wants ID=VALUE (got %r)" % item)
 
 
 def _print_boards(bits, creds):
@@ -295,7 +360,11 @@ def _resolve_target(parser, args):
     if args.dest is None:
         args.dest = DEST_DEFAULT
 
-    if not args.port and not args.dry_run:
+    # --process-only and --list-controls are entirely local, like
+    # --dry-run: they compile a .grc and stop, so demanding a port would
+    # mean plugging a board in to do code generation.
+    if not args.port and not (args.dry_run or args.process_only
+                              or args.list_controls):
         # Never inferred from --board: bitstreams.json records nothing about
         # how to reach a board, because a recorded port goes stale and
         # deploys to the wrong one.
@@ -326,12 +395,169 @@ def _resolve_target(parser, args):
     return steps, False
 
 
+def _process(args):
+    """Turn a .grc into a .py, if that is what --flowgraph named.
+
+    Rewrites args.flowgraph to the generated file and records the source
+    directory in args.search_dirs, so everything downstream -- payload
+    assembly, --params checking, the name the board runs -- works on the
+    generated Python and never has to know a .grc was involved.
+
+    A .py --flowgraph passes straight through, which is what keeps the CI
+    path unchanged.
+    """
+    args.search_dirs = ()
+    args.generated = None
+    if not args.flowgraph or not generate.looks_like_grc(args.flowgraph):
+        if args.process_only:
+            report.die("--process-only needs a .grc; %s is already generated "
+                       "Python" % args.flowgraph, code=EXIT_USAGE)
+        return
+
+    if args.no_process:
+        report.die(
+            "--flowgraph %s is a .grc and --no-process was given. Compile it "
+            "yourself (grcc -o DIR %s) and pass the .py."
+            % (args.flowgraph, args.flowgraph), code=EXIT_USAGE)
+
+    try:
+        gen = generate.process(
+            args.flowgraph, expect_target=args.mode,
+            allow_message_controls=args.allow_message_controls,
+            build_dir=args.build_dir, grcc=args.grcc,
+            dry_run=args.transform_only)
+    except (GrcError, GenerateError) as exc:
+        report.die(str(exc), code=EXIT_USAGE)
+
+    args.generated = gen
+    if gen.py_path is None:  # --transform-only
+        return
+    args.flowgraph = gen.py_path
+    args.search_dirs = (gen.source_dir,)
+
+
+def _watch_process(args):
+    """--process-only --watch: recompile on every save until Ctrl-C.
+
+    Deliberately does not deploy. The point of watching is to keep the
+    generated .py honest while the flowgraph is being edited; pushing each
+    save to a board -- possibly one mid-run -- is a separate decision, and
+    one a tool should not make on its own.
+    """
+    w = watch.Watcher(args.flowgraph)
+    report.say("cli", "watching %s -- Ctrl-C to stop" % args.flowgraph)
+    try:
+        while True:
+            time.sleep(0.25)
+            if not w.poll():
+                continue
+            w.acknowledge()
+            report.blank()
+            report.say("cli", "%s changed -- reprocessing"
+                       % os.path.basename(args.flowgraph))
+            try:
+                generate.process(
+                    args.flowgraph, expect_target=args.mode,
+                    allow_message_controls=args.allow_message_controls,
+                    build_dir=args.build_dir, grcc=args.grcc,
+                    dry_run=args.transform_only)
+            except (GrcError, GenerateError) as exc:
+                # Keep watching. A flowgraph saved mid-edit is routinely
+                # invalid for a few seconds, and exiting on the first bad
+                # save would make the mode useless exactly when it helps.
+                report.error(str(exc))
+    except KeyboardInterrupt:
+        report.blank()
+        report.say("cli", "stopped watching")
+    return EXIT_OK
+
+
+def _print_controls(args):
+    """--list-controls: the read-only half of the control channel.
+
+    Live control from the CLI is deliberately not planned -- a slider is a
+    GUI thing. What the CLI needs is to be able to SAY what is settable, so
+    that a --set typo can be diagnosed without opening the GUI.
+    """
+    gen = getattr(args, "generated", None)
+    if gen is None:
+        report.die("--list-controls needs a .grc: the control spec is built "
+                   "by the headless transform, and a .py that is already "
+                   "generated has no record of the widgets it came from.",
+                   code=EXIT_USAGE)
+    report.banner("CONTROLS")
+    if not gen.controls:
+        report.say("controls", "this flowgraph has no QT GUI input blocks, "
+                               "so there is nothing to control live")
+        return EXIT_OK
+    for c in gen.controls:
+        report.kv(c.id, _describe_control(c))
+    report.blank()
+    report.say("controls", "set one at launch with --run --set %s=<value>"
+               % gen.controls[0].id)
+    return EXIT_OK
+
+
+def _describe_control(c):
+    bits = ["%s (%s)" % (c.kind, c.dtype), "default %r" % (c.default,)]
+    if c.free_entry:
+        bits.append("free entry -- %s" % (c.note or "value not evaluable"))
+    elif c.kind == controls_mod.KIND_RANGE:
+        bits.append("%s..%s step %s" % (c.extra["start"], c.extra["stop"],
+                                        c.extra["step"]))
+    elif c.kind == controls_mod.KIND_CHOOSER:
+        bits.append("one of %s"
+                    % ", ".join(repr(o) for o in c.extra["options"]))
+    elif c.kind == controls_mod.KIND_CHECK_BOX:
+        bits.append("%r / %r" % (c.extra["true_value"],
+                                 c.extra["false_value"]))
+    elif c.kind == controls_mod.KIND_PUSH_BUTTON:
+        bits.append("pulses %r then %r" % (c.extra["pressed"],
+                                           c.extra["released"]))
+    if c.label and c.label != c.id:
+        bits.append("labelled %r" % c.label)
+    return "; ".join(bits)
+
+
+def _resolve_sets(args, controls_by_id):
+    """--set ID=VALUE pairs, coerced against the spec. Exits on a bad one.
+
+    Coerced here rather than on the board so a typo is caught before a
+    single byte reaches the console: the board would refuse it too, but as
+    an ERR line in the middle of a live run rather than as a usage error.
+    """
+    resolved = []
+    for item in args.set_controls:
+        cid, _, text = item.partition("=")
+        cid = cid.strip()
+        control = controls_by_id.get(cid)
+        if control is None:
+            report.die(
+                "--set %s: the deployed flowgraph has no control called %r. "
+                "It has: %s" % (item, cid,
+                                ", ".join(sorted(controls_by_id)) or "(none)"),
+                code=EXIT_USAGE)
+        try:
+            resolved.append((control, controls_mod.coerce_value(control,
+                                                                text)))
+        except ControlError as exc:
+            report.die("--set %s: %s" % (item, exc), code=EXIT_USAGE)
+    return resolved
+
+
 def _prepare_payload(args):
     """Collect + build the payload, print the manifest/ETA banner. Returns
     the Payload, or exits with EXIT_USAGE on a PayloadError."""
+    # fau_ctl.py and ui_spec.json ride along as ordinary siblings when the
+    # flowgraph has controls. Named explicitly rather than found by the
+    # import scanner: the generated .py imports fau_ctl inside the injected
+    # snippet function, which an AST walk of the top level never sees.
+    gen = getattr(args, "generated", None)
+    extra = list(args.extra) + list(gen.extra_files if gen else ())
     try:
         entries, main_arc = payload.collect_files(
-            args.flowgraph, extra=args.extra, max_bytes=args.max_bytes)
+            args.flowgraph, extra=extra, max_bytes=args.max_bytes,
+            search_dirs=getattr(args, "search_dirs", ()))
     except PayloadError as exc:
         report.die(str(exc), code=EXIT_USAGE)
 
@@ -379,6 +605,14 @@ def _shutdown_receiver(session):
 
 
 
+def _apply_sets(runner, pending):
+    for control, value in pending:
+        try:
+            report.say("control", runner.set_control(control.id, value))
+        except RunError as exc:
+            report.warn(str(exc))
+
+
 def _run_flowgraph(session, transport, reader, args, main_name):
     """Run the flowgraph in the foreground and stream its output.
 
@@ -396,22 +630,40 @@ def _run_flowgraph(session, transport, reader, args, main_name):
     except ParamError as exc:
         report.die(str(exc), code=EXIT_USAGE)
 
+    gen = getattr(args, "generated", None)
+    by_id = {c.id: c for c in (gen.controls if gen else ())}
+    pending = _resolve_sets(args, by_id)
+
     r = Runner(session, transport, reader, args.dest, main_name,
-               params=tokens, sudo=not args.no_sudo)
+               params=tokens, sudo=not args.no_sudo,
+               control_ids=tuple(by_id),
+               on_control=lambda reply: report.say(
+                   "control", "%s %s %s" % (reply.kind, reply.id or "",
+                                            reply.text)))
     report.banner("RUN")
     report.say("run", r.command)
     report.say("run", "Ctrl-C stops the flowgraph (it does not abort "
                       "fau-deploy)")
+    if by_id:
+        report.say("run", "control channel: %s" % ", ".join(sorted(by_id)))
 
     stop = {"asked": False}
 
     def on_sigint(_sig, _frame):
         stop["asked"] = True
 
+    def on_line(line):
+        report.say("board", line)
+        # Applied on READY rather than after a fixed delay: READY is the
+        # board saying the dispatcher's reader thread is up, so a SET sent
+        # then cannot land before anything is listening for it.
+        if pending and "READY" in line and r.controllable:
+            _apply_sets(r, pending)
+            del pending[:]
+
     previous = signal.signal(signal.SIGINT, on_sigint)
     try:
-        result = r.run(on_line=lambda line: report.say("board", line),
-                       should_stop=lambda: stop["asked"])
+        result = r.run(on_line=on_line, should_stop=lambda: stop["asked"])
     finally:
         signal.signal(signal.SIGINT, previous)
 
@@ -420,6 +672,9 @@ def _run_flowgraph(session, transport, reader, args, main_name):
     report.kv("stopped by operator", result.terminated)
     report.kv("output lines", result.lines)
     report.kv("elapsed", "%.1fs" % result.elapsed)
+    if by_id:
+        report.kv("controls acked", result.control_acks)
+        report.kv("control errors", result.control_errors)
 
     if result.wedged:
         return EXIT_WEDGED
@@ -437,11 +692,22 @@ def main(argv=None):
     if listed_only:
         return EXIT_OK
 
-    deploy = not args.no_deploy
+    deploy = not args.no_deploy and not args.process_only
     if (deploy or args.run) and not args.flowgraph:
         parser.error("--flowgraph is required to deploy or run "
                     "(pass --no-deploy with neither to only load a "
                     "bitstream)")
+
+    # Before anything opens a port: compiling a .grc is local, and failing
+    # here costs nothing, whereas failing after login leaves a session to
+    # tear down for no reason.
+    _process(args)
+    if args.list_controls:
+        return _print_controls(args)
+    if args.process_only:
+        if args.watch:
+            return _watch_process(args)
+        return EXIT_OK
 
     pl = _prepare_payload(args) if deploy else None
     main_name = os.path.basename(args.flowgraph) if args.flowgraph else None

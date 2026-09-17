@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 from ..core import runner
@@ -342,3 +343,186 @@ class TestTerminate(RunnerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------
+# The live control channel.
+#
+# Run against the same real pty and real /bin/sh as everything else here,
+# with the REAL board/fau_ctl.py as the flowgraph's dispatcher, because the
+# properties worth checking are all about the console being one shared,
+# echoing, lossy channel: that a SET reaches a foreground process's stdin
+# at all, that its echo does not get logged as flowgraph output, and that
+# a reply comes back tagged with this run's nonce and no other.
+# ---------------------------------------------------------------------
+
+BOARD_DIR = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "board")
+
+# Stands in for a generated flowgraph with the injected snippet: it starts
+# the real fau_ctl against a stub top block and then blocks the way
+# `run_options: run` makes the real one block in tb.wait().
+CTL_FLOWGRAPH = '''\
+import signal, sys, time
+# No sys.path games: fau_ctl is imported from the deploy directory, the
+# way the board does it. That is load-bearing, not incidental --
+# load_controls() looks for ui_spec.json beside fau_ctl.py's own file, so
+# importing the repo's copy instead of the deployed one finds no spec and
+# silently starts no control channel. Which is exactly what this test hit.
+import fau_ctl
+
+class TB:
+    def __init__(self):
+        self.gain = 0.5
+    def set_gain(self, value):
+        self.gain = value
+        print("gain now %r" % (value,), flush=True)
+    def set_boom(self, value):
+        raise ValueError("no")
+    def stop(self):
+        print("STOPPING", flush=True)
+        global running
+        running = False
+
+tb = TB()
+running = True
+fau_ctl.start(tb)
+print("STARTED", flush=True)
+while running:
+    time.sleep(0.05)
+print("HALTED", flush=True)
+'''
+
+CTL_SPEC = {
+    "version": 1,
+    "flowgraph": "ctl",
+    "controls": [
+        {"id": "gain", "kind": "range", "label": "Gain", "dtype": "float",
+         "default": 0.5, "free_entry": False, "start": 0.0, "stop": 1.0,
+         "step": 0.01, "widget": "slider"},
+        {"id": "boom", "kind": "entry", "label": "Boom", "dtype": "int",
+         "default": 0, "free_entry": False},
+    ],
+}
+
+
+class TestControlChannel(RunnerTestCase):
+    def setUp(self):
+        RunnerTestCase.setUp(self)
+        import json
+        import shutil as _shutil
+        _shutil.copy(os.path.join(BOARD_DIR, "fau_ctl.py"), self.dest)
+        with open(os.path.join(self.dest, "ui_spec.json"), "w") as fh:
+            json.dump(CTL_SPEC, fh)
+        self.main = self._script(CTL_FLOWGRAPH, "ctl_fg.py")
+        self.replies = []
+        self.lines = []
+
+    def _run(self, drive, ids=("gain", "boom")):
+        """Start the flowgraph, call `drive(runner)` once it is READY, then
+        stop it. Returns the RunResult."""
+        r = self._runner(self.main, control_ids=ids,
+                         on_control=self.replies.append)
+        state = {"driven": False}
+
+        def on_line(line):
+            self.lines.append(line)
+            if "STARTED" in line and not state["driven"]:
+                state["driven"] = True
+                drive(r)
+                state["at"] = time.monotonic()
+
+        def should_stop():
+            # Give the replies a moment to come back before Ctrl-C.
+            return state.get("at") and time.monotonic() - state["at"] > 1.0
+
+        return r.run(on_line=on_line, should_stop=should_stop)
+
+    def test_a_set_reaches_the_flowgraph_and_is_acknowledged(self):
+        result = self._run(lambda r: r.set_control("gain", 0.25))
+        self.assertTrue(any("gain now 0.25" in line for line in self.lines),
+                        self.lines)
+        acks = [x for x in self.replies if x.ok]
+        self.assertTrue(acks, self.replies)
+        self.assertEqual((acks[-1].id, acks[-1].value), ("gain", 0.25))
+        self.assertEqual(result.control_acks, len(acks))
+
+    def test_the_board_announces_ready(self):
+        self._run(lambda r: None)
+        self.assertTrue(any(x.kind == "READY" for x in self.replies),
+                        self.replies)
+
+    def test_replies_are_kept_out_of_the_flowgraph_output(self):
+        self._run(lambda r: r.set_control("gain", 0.75))
+        self.assertFalse([line for line in self.lines if "FAU-CTL" in line],
+                         self.lines)
+
+    def test_the_consoles_echo_of_our_own_line_is_not_logged(self):
+        # The board's tty echoes everything written to it; without the echo
+        # filter a dragged slider fills the log with its own SET lines.
+        self._run(lambda r: r.set_control("gain", 0.75))
+        self.assertFalse([line for line in self.lines
+                          if line.strip().startswith("SET ")], self.lines)
+
+    def test_a_setter_that_raises_comes_back_as_an_error_not_a_crash(self):
+        result = self._run(lambda r: r.set_control("boom", 1))
+        errors = [x for x in self.replies if x.kind == "ERR"]
+        self.assertTrue(errors, self.replies)
+        self.assertEqual(errors[-1].id, "boom")
+        self.assertEqual(result.control_errors, len(errors))
+        # ...and the run still stops cleanly afterwards.
+        self.assertEqual(result.rc, 0)
+
+    def test_pulse_is_validated_on_the_board_not_only_here(self):
+        result = self._run(lambda r: r.pulse_control("gain", 20))
+        # gain has no pressed/released, so the board refuses it -- which is
+        # the check: PULSE is validated there, not only here.
+        self.assertTrue(any(x.kind == "ERR" and "use SET" in x.text
+                            for x in self.replies), self.replies)
+        self.assertEqual(result.rc, 0)
+
+    def test_control_writes_are_refused_before_the_run_starts(self):
+        r = self._runner(self.main, control_ids=("gain",))
+        with self.assertRaises(runner.RunError):
+            r.set_control("gain", 1.0)
+
+    def test_control_writes_are_refused_after_the_run_ends(self):
+        r = self._runner(self._script(FAST, "fast.py"), control_ids=("gain",))
+        r.run()
+        with self.assertRaises(runner.RunError):
+            r.set_control("gain", 1.0)
+
+    def test_an_id_not_in_the_payload_is_refused_before_anything_is_written(self):
+        # The gate: the deployer will not put a line on the console for an
+        # id the deployed payload's ui_spec.json does not declare, because
+        # such a line could be one that ends the run instead.
+        def drive(r):
+            with self.assertRaises(runner.RunError):
+                r.set_control("nonexistent", 1)
+        self._run(drive)
+
+    def test_a_run_without_controls_is_not_controllable(self):
+        r = self._runner(self._script(FAST, "plain.py"))
+        self.assertFalse(r.controllable)
+        self.assertNotIn(runner.NONCE_FILENAME, r.command)
+
+    def test_a_run_with_controls_stamps_the_nonce_file(self):
+        r = self._runner(self.main, control_ids=("gain",))
+        self.assertTrue(r.controllable)
+        self.assertIn(runner.NONCE_FILENAME, r.command)
+        self.assertIn(r.nonce, r.command)
+
+    def test_the_nonce_file_is_written_where_fau_ctl_reads_it(self):
+        self._run(lambda r: r.set_control("gain", 0.5))
+        path = os.path.join(self.dest, runner.NONCE_FILENAME)
+        self.assertTrue(os.path.isfile(path))
+
+    def test_a_reply_tagged_with_another_nonce_is_ignored(self):
+        # Flowgraph stdout cannot forge a reply for this run.
+        r = self._runner(self.main, control_ids=("gain",),
+                         on_control=self.replies.append)
+        result = runner.RunResult()
+        self.assertFalse(
+            r._route_control("FAU-CTL-zzzzzz OK gain 9.0", result))
+        self.assertEqual(self.replies, [])
+        self.assertEqual(result.control_acks, 0)

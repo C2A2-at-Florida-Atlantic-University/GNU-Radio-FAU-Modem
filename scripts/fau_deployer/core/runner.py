@@ -15,15 +15,19 @@ plan doc originally proposed). Two reasons, both load-bearing:
     def sig_handler(sig=None, frame=None):
         tb.stop(); tb.wait(); sys.exit(0)
     signal.signal(signal.SIGINT, sig_handler)
-  and tb.wait() returning is what runs the block destructors, which carry
-  the required DMACR.RS clear -> poll DMASR.Halted -> fabric reset. Nothing
-  needs to be added around it.
+  and it is `tb.stop()` that carries the required DMACR.RS clear -> poll
+  DMASR.Halted -> reset: the teardown lives in the blocks' `stop()`
+  overrides (fau_sink_impl.cc:421, fau_source_impl.cc:450), which
+  top_block.stop() calls. Their **destructors are empty**
+  (`~fau_sink_impl() {}`) -- an earlier version of this docstring credited
+  them, which matters because it is the reason nothing needs to be added
+  around the generated code. Nothing does.
 - **The shell's exit status is stronger evidence than a sentinel printed
-  from inside Python.** A `print("halted")` before the destructors run can
+  from inside Python.** A `print("halted")` before stop() has finished can
   be emitted and THEN wedge; `echo FAU-RC-<nonce>:$?` only appears once the
-  process is genuinely reaped, destructors included. So the completion
-  marker is the same FAU-RC mechanism core/session.py's run() uses, just
-  nonce-tagged so flowgraph stdout cannot forge it.
+  process is genuinely reaped. So the completion marker is the same FAU-RC
+  mechanism core/session.py's run() uses, just nonce-tagged so flowgraph
+  stdout cannot forge it.
 
 Foreground only, deliberately. Backgrounding with `&` would move the
 flowgraph out of the console's foreground process group, so Ctrl-C would no
@@ -72,6 +76,15 @@ trailing newline, so it stays in the LineReader's tail and is never
 reported as an output line; and a flowgraph exiting on its own via that
 prompt is indistinguishable here from one that ran to completion, which is
 fine -- both produce a real exit status.
+
+**The one exception, and why it is safe: the control channel.** A payload
+the Process phase built has `run_options: run` forced into it, so it has
+no `input()` at all -- it goes straight to `tb.wait()` and its stdin is
+free. Such a payload also carries a `ui_spec.json`, and set_control() will
+only write a line naming an id that file declares. So the permission comes
+from the payload, not from the run state: deploy a hand-written .py and
+`controllable` is False, no panel appears and no write is possible. The
+prohibition above still holds in full for every other byte.
 """
 
 import dataclasses
@@ -79,6 +92,7 @@ import re
 import shlex
 import time
 
+from . import controls as controls_mod
 from . import report
 from .protocol import new_nonce
 
@@ -133,6 +147,20 @@ class RunResult:
     elapsed: float = 0.0
     lines: int = 0
 
+    control_acks: int = 0
+    """FAU-CTL OK replies seen. Not an error count's mirror image: a
+    control whose setter raised still comes back, as an ERR."""
+
+    control_errors: int = 0
+    """FAU-CTL ERR replies seen. Non-zero does not endanger the board --
+    fau_ctl catches everything out of a setter -- but it means some
+    widget did not do what the operator asked."""
+
+    control_ready: bool = False
+    """True once the board announced its control channel. A run with a
+    spec that never goes ready means fau_ctl did not start: the usual
+    cause is a payload missing fau_ctl.py or ui_spec.json."""
+
     @property
     def clean(self):
         """Ran and stopped with the console handed back, whether it exited
@@ -142,8 +170,14 @@ class RunResult:
         return self.rc is not None and self.prompt_returned and not self.wedged
 
 
+# The board-side control dispatcher reads the run nonce out of this file,
+# written by the run command itself. See NONCE_FILENAME in
+# board/fau_ctl.py for why it is a file and not an environment variable.
+NONCE_FILENAME = ".fau_ctl_nonce"
+
+
 def build_command(dest, main_name, params=(), python="python3", nonce=None,
-                 sudo=True):
+                 sudo=True, controls=False):
     """The one line sent to the console, and the nonce its completion marker
     is tagged with. Returns (command_text, nonce).
 
@@ -173,8 +207,17 @@ def build_command(dest, main_name, params=(), python="python3", nonce=None,
     # sudo does not change directory, so the preceding `cd` still decides
     # what "./" means.
     prefix = "sudo -n " if sudo else ""
-    cmd = "cd %s && %s%s; echo \"FAU-RC-%s:$?\"" % (
-        shlex.quote(dest), prefix,
+    # Only when there is a control channel, so a run without one produces
+    # byte-for-byte the command it always did. Chained with && like the cd:
+    # if the nonce cannot be written the run does not start, and the echo
+    # still reports a status, rather than the flowgraph coming up with a
+    # control channel whose replies nothing can match.
+    stamp = ""
+    if controls:
+        stamp = "printf %s > %s && " % (
+            shlex.quote(nonce), shlex.quote(NONCE_FILENAME))
+    cmd = "cd %s && %s%s%s; echo \"FAU-RC-%s:$?\"" % (
+        shlex.quote(dest), stamp, prefix,
         " ".join(shlex.quote(a) for a in argv), nonce)
     return cmd, nonce
 
@@ -183,7 +226,7 @@ class Runner:
     def __init__(self, session, transport, reader, dest, main_name,
                 params=(), python="python3",
                 terminate_timeout=TERMINATE_TIMEOUT_DEFAULT, nonce=None,
-                sudo=True):
+                sudo=True, control_ids=(), on_control=None):
         self._session = session
         self._transport = transport
         self._reader = reader
@@ -192,8 +235,14 @@ class Runner:
         self._params = list(params)
         self._python = python
         self._terminate_timeout = terminate_timeout
+        # The ids the payload's ui_spec.json declared. Empty means this run
+        # has NO control channel, and that is the gate on every console
+        # write below -- see set_control().
+        self._control_ids = frozenset(control_ids)
+        self._on_control = on_control
         self._cmd, self._nonce = build_command(
-            dest, main_name, self._params, python, nonce, sudo=sudo)
+            dest, main_name, self._params, python, nonce, sudo=sudo,
+            controls=bool(self._control_ids))
         self._rc_re = re.compile(r"FAU-RC-%s:(\d+)" % re.escape(self._nonce))
         # The console's echo of what we sent contains the marker with $?
         # STILL UNEXPANDED, which the real status line never does. Matching
@@ -203,6 +252,61 @@ class Runner:
         # "./test_chirp.p.py", which then got logged as board output.
         self._echo_marker = "FAU-RC-%s:$?" % self._nonce
         self._interrupt_sent = False
+        self._running = False
+
+    @property
+    def nonce(self):
+        return self._nonce
+
+    @property
+    def controllable(self):
+        """True if this run carries a control channel at all.
+
+        Front-ends gate their control panel on this rather than on the
+        run state alone. A hand-written .py -- which the tool still
+        accepts -- has grcc's `input('Press Enter to quit: ')` in it, so
+        the first SET line would END THE RUN rather than set anything.
+        No spec in the payload, no panel, no writes.
+        """
+        return bool(self._control_ids)
+
+    def set_control(self, cid, value):
+        """Send one SET line. Safe to call from the UI thread.
+
+        Writing to the console while a flowgraph runs is normally
+        forbidden (see the module docstring), and this is the one gated
+        exception: it is permitted only for an id the payload's
+        ui_spec.json declared, which can only exist on a payload the
+        Process phase built, which is the only kind that forced
+        `run_options: run` and so has no `input()` waiting to eat the
+        line.
+
+        Like terminate(), one write of one complete line, never
+        interleaved mid-line.
+        """
+        return self._write_control(controls_mod.wire_set(cid, value), cid)
+
+    def pulse_control(self, cid, ms):
+        """Send one PULSE line: press, hold `ms` on the board, release.
+
+        The hold is timed on the board so the edge width does not depend
+        on the console's latency, which matters for a button wired to a
+        reset or a command burst.
+        """
+        return self._write_control(controls_mod.wire_pulse(cid, ms), cid)
+
+    def _write_control(self, line, cid):
+        if cid not in self._control_ids:
+            raise RunError(
+                "%r is not a control of the running flowgraph. The deployer "
+                "will only write to the console for an id the deployed "
+                "payload's ui_spec.json declares -- anything else could be "
+                "a line that ends the run instead of setting a value." % cid)
+        if not self._running:
+            raise RunError(
+                "nothing is running, so there is nothing to control.")
+        self._transport.write((line + "\r").encode("utf-8"))
+        return line
 
     @property
     def command(self):
@@ -227,6 +331,33 @@ class Runner:
         self._interrupt_sent = True
         self._transport.write(b"\x03")
 
+    def _route_control(self, line, result):
+        """Take a FAU-CTL reply (or our own echoed SET) out of the output
+        stream. True if the line was consumed.
+
+        Both halves matter for a readable log. The replies are bookkeeping
+        that belongs against a widget, not interleaved with flowgraph
+        output; and the board's tty echoes every line we write, so without
+        the echo filter a dragged slider would fill the log with its own
+        SET lines.
+        """
+        if not self._control_ids:
+            return False
+        if controls_mod.is_control_echo(line, self._control_ids):
+            return True
+        reply = controls_mod.parse_reply(line, self._nonce)
+        if reply is None:
+            return False
+        if reply.kind == "READY":
+            result.control_ready = True
+        elif reply.ok:
+            result.control_acks += 1
+        else:
+            result.control_errors += 1
+        if self._on_control is not None:
+            self._on_control(reply)
+        return True
+
     def run(self, on_line=None, should_stop=None, poll=POLL_INTERVAL):
         """Start the flowgraph and block until it stops. Returns a
         RunResult; raises RunError only for a failure to start.
@@ -238,46 +369,57 @@ class Runner:
         during it.
         """
         t0 = time.monotonic()
+        self._running = True
         self._transport.write((self._cmd + "\r").encode("utf-8"))
 
         result = RunResult()
         deadline = None  # set once Ctrl-C has been sent
 
-        while True:
-            for line in self._reader.lines(poll):
-                if line.strip() == self._cmd or self._echo_marker in line:
-                    continue  # the console's own echo of what we sent
-                if RE_SUDO_DENIED.search(line):
-                    result.sudo_denied = True
-                m = self._rc_re.search(line)
-                if m:
-                    result.rc = int(m.group(1))
+        try:
+            while True:
+                for line in self._reader.lines(poll):
+                    if line.strip() == self._cmd or self._echo_marker in line:
+                        continue  # the console's own echo of what we sent
+                    if RE_SUDO_DENIED.search(line):
+                        result.sudo_denied = True
+                    m = self._rc_re.search(line)
+                    if m:
+                        result.rc = int(m.group(1))
+                        break
+                    if self._route_control(line, result):
+                        continue
+                    result.lines += 1
+                    if on_line is not None:
+                        on_line(line)
+                if result.rc is not None:
                     break
-                result.lines += 1
-                if on_line is not None:
-                    on_line(line)
-            if result.rc is not None:
-                break
 
-            if (should_stop is not None and should_stop()
-                    and not self._interrupt_sent):
-                report.say("run", "stopping the flowgraph (Ctrl-C) -- "
-                                  "waiting for it to halt cleanly")
-                self.terminate()
-                result.terminated = True
-                deadline = time.monotonic() + self._terminate_timeout
+                if (should_stop is not None and should_stop()
+                        and not self._interrupt_sent):
+                    report.say("run", "stopping the flowgraph (Ctrl-C) -- "
+                                      "waiting for it to halt cleanly")
+                    self.terminate()
+                    result.terminated = True
+                    deadline = time.monotonic() + self._terminate_timeout
 
-            if deadline is not None and time.monotonic() > deadline:
-                result.wedged = True
-                result.elapsed = time.monotonic() - t0
-                report.error(
-                    "the flowgraph did not report an exit status within "
-                    "%.0fs of Ctrl-C. It may still be running with DMA "
-                    "live. NOT escalating to a kill -- that would orphan "
-                    "the AXI burst and can wedge the board until a power "
-                    "cycle. Check the console by hand."
-                    % self._terminate_timeout)
-                return result
+                if deadline is not None and time.monotonic() > deadline:
+                    result.wedged = True
+                    result.elapsed = time.monotonic() - t0
+                    report.error(
+                        "the flowgraph did not report an exit status within "
+                        "%.0fs of Ctrl-C. It may still be running with DMA "
+                        "live. NOT escalating to a kill -- that would orphan "
+                        "the AXI burst and can wedge the board until a power "
+                        "cycle. Check the console by hand."
+                        % self._terminate_timeout)
+                    return result
+        finally:
+            # Closes the control-write gate on every exit path, including
+            # the wedged return above and any exception: once this returns
+            # there is no foreground process to receive a line, so a late
+            # write from a UI thread would land at the shell prompt and be
+            # run as a command.
+            self._running = False
 
         # The exit status proves the process is reaped; the prompt that
         # follows is printed asynchronously after it, and has to be consumed

@@ -1,0 +1,138 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://fau.edu/gnu-radio-fau-modem/schemas/ui_spec.schema.json",
+    "title": "ControlSpec",
+    "description": "Control spec (ui_spec.json) for the FAU flowgraph deployer: the QT GUI input blocks of one flowgraph, as the headless transform found them before freezing each into a plain `variable`. Unlike bitstreams.json and credentials.json this is a BUILD ARTIFACT, not a config file -- core/controls.py writes it into the build directory next to the generated .py and it is never hand-edited. It exists because the freeze is lossy: once a variable_qtgui_range is a `variable`, its bounds, step, labels and widget style are gone from the flowgraph. Three consumers read it: the GUI renders its control panel from it, the CLI's --list-controls prints it, and board/fau_ctl.py uses the ids as the whitelist of attributes a SET line is allowed to name.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["version", "controls"],
+    "properties": {
+        "version": {
+            "const": 1,
+            "description": "Spec format version. core/controls.py refuses any other value rather than guessing at a shape it has not been read against; regenerating the flowgraph rewrites the file."
+        },
+        "flowgraph": {
+            "type": "string",
+            "description": "The flowgraph's `id` option -- the same name grcc gives the generated .py and its top_block class. Informational: nothing keys off it, it is there so a spec found on its own can be traced back."
+        },
+        "controls": {
+            "type": "array",
+            "description": "One entry per enabled QT GUI input block, in the flowgraph's own block order so the deployer's panel is stable across regenerations rather than reshuffling. An empty list is valid and meaningful: it says the flowgraph was processed and genuinely has no controls, which is what tells the deployer to show no panel.",
+            "items": { "$ref": "#/$defs/Control" }
+        }
+    },
+    "$defs": {
+        "Value": {
+            "description": "A control value. Limited to what survives a JSON round trip AND a repr()/ast.literal_eval() round trip unchanged, because it travels as JSON in this file and as a Python literal on the wire. A tuple is the realistic exclusion: JSON returns it as a list, which would not compare equal to the option the flowgraph expects. core/controls.py degrades such a control to free_entry rather than writing it here.",
+            "type": ["boolean", "integer", "number", "string", "null", "array", "object"]
+        },
+        "Control": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "kind", "label", "dtype", "default", "free_entry"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+                    "description": "The variable's id -- the GRC block's `name`, and the attribute the generated flowgraph exposes as tb.set_<id>(). A Python identifier, checked as one here because fau_ctl.py resolves it with getattr() on the running top block."
+                },
+                "kind": {
+                    "enum": ["range", "entry", "chooser", "check_box", "push_button"],
+                    "description": "Which of the five QT GUI input blocks this came from, and therefore which widget the deployer renders. The QT GUI sinks have no entry here and never will: a time sink at 400 ksps complex is ~3.2 MB/s against a console that carries ~11.5 KB/s."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Operator-facing label, falling back to the id when the block's label was blank -- the same fallback the Qt widget makes."
+                },
+                "dtype": {
+                    "enum": ["float", "int", "str", "bool", "raw"],
+                    "description": "What the value is, in Python's names rather than GRC's (GRC calls a float 'real'). 'raw' is GRC's Any: the deployer parses what is typed with ast.literal_eval and sends whatever comes out."
+                },
+                "default": {
+                    "$ref": "#/$defs/Value",
+                    "description": "The value the flowgraph starts at -- the same value the frozen `variable` holds, so a deployer widget showing it is telling the truth about the running flowgraph before anything is sent. Null when free_entry is true and the block's value would not evaluate."
+                },
+                "free_entry": {
+                    "type": "boolean",
+                    "description": "True when at least one of this control's fields is a GRC expression (`samp_rate/2`) rather than a literal, so the bounds/options are not knowable without running the flowgraph. The deployer renders a plain text box instead of the intended widget and reports why. Carried per-control on purpose: one unevaluable bound should not cost the operator every other slider."
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Why this control is not quite what the block asked for -- an unevaluable bound, or the QT GUI Entry bool case where stock GRC's bool(str) conversion cannot express False and the deployer substitutes a real checkbox."
+                },
+                "start": { "type": "number", "description": "range: low end of the slider." },
+                "stop": { "type": "number", "description": "range: high end of the slider." },
+                "step": { "type": "number", "description": "range: the increment, as GRC's Range takes it." },
+                "widget": {
+                    "enum": ["counter_slider", "counter", "slider", "dial", "combo_box", "radio_buttons"],
+                    "description": "range: which Qt widget the block asked for (counter_slider/counter/slider/dial). chooser: combo_box or radio_buttons. Advisory -- the deployer renders the nearest Tk equivalent."
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/Value" },
+                    "description": "chooser: the closed set of values. The best-behaved of the five kinds, because a closed set is something fau_ctl.py can validate exactly rather than merely type-check."
+                },
+                "labels": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "chooser: one display label per option, same length as `options`. A blank label in the flowgraph is replaced by str(option), which is what the combo box would have shown."
+                },
+                "true_value": {
+                    "$ref": "#/$defs/Value",
+                    "description": "check_box: the value sent when checked. NOT necessarily a boolean -- the block builds {True: <true>, False: <false>} from two arbitrary values of the declared type."
+                },
+                "false_value": {
+                    "$ref": "#/$defs/Value",
+                    "description": "check_box: the value sent when unchecked."
+                },
+                "pressed": {
+                    "$ref": "#/$defs/Value",
+                    "description": "push_button: the value sent on press. The button is momentary, so a press is two set_ calls with the operator's hold time between them; PULSE carries that width as a number so the board reproduces it locally instead of it becoming whatever the serial link's latency was."
+                },
+                "released": {
+                    "$ref": "#/$defs/Value",
+                    "description": "push_button: the value sent on release, and the value the variable rests at."
+                }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "kind": { "const": "range" } }, "required": ["kind"] },
+                    "then": {
+                        "anyOf": [
+                            { "required": ["start", "stop", "step"] },
+                            { "properties": { "free_entry": { "const": true } }, "required": ["free_entry"] }
+                        ]
+                    }
+                },
+                {
+                    "if": { "properties": { "kind": { "const": "chooser" } }, "required": ["kind"] },
+                    "then": {
+                        "anyOf": [
+                            { "required": ["options", "labels"] },
+                            { "properties": { "free_entry": { "const": true } }, "required": ["free_entry"] }
+                        ]
+                    }
+                },
+                {
+                    "if": { "properties": { "kind": { "const": "check_box" } }, "required": ["kind"] },
+                    "then": {
+                        "anyOf": [
+                            { "required": ["true_value", "false_value"] },
+                            { "properties": { "free_entry": { "const": true } }, "required": ["free_entry"] }
+                        ]
+                    }
+                },
+                {
+                    "if": { "properties": { "kind": { "const": "push_button" } }, "required": ["kind"] },
+                    "then": {
+                        "anyOf": [
+                            { "required": ["pressed", "released"] },
+                            { "properties": { "free_entry": { "const": true } }, "required": ["free_entry"] }
+                        ]
+                    }
+                }
+            ]
+        }
+    }
+}
