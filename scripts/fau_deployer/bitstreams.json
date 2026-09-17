@@ -3,5 +3,11 @@
         "bootstrap": "/home/petalinux/firmware/Radio_Top_v2_wrapper.bit.bin",
         "tx": "/home/petalinux/S10_dac.bit.bin",
         "rx": "/home/petalinux/S10_adc.bit.bin"
+    },
+
+    "M20": {
+        "bootstrap": "/home/petalinux/firmware/SDUAM_wrapper_20.bit.bin",
+        "tx": "/home/petalinux/M20_dac.bit.bin",
+        "rx": "/home/petalinux/SDUAM_wrapper_m20.bit.bin"
     }
 }

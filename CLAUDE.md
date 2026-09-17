@@ -52,6 +52,12 @@ mandatory, there is no dmaengine channel and no `/dev/uio*`.
 Sample format: one `uint32` per complex sample, LE, `[15:0]`=I (signed Q15),
 `[31:16]`=Q, scale `32767.0`.
 
+Not in the table because it is not in the PL at all: the **RX analog gain
+DAC (DAC7512) is on PS SPI1, `0xE0007000`, chip select 1** (`SS2` on the same
+bus is the LTC2171 ADC — a different device). Being PS-side, its setting
+survives a fabric reset and a process restart, so it is the one piece of
+board state `fau_source` owns that does *not* get reprogrammed at every arm.
+
 This map lives as C++ `constexpr` in
 `gr-fau_modem/lib/hw/board_map.h` — that header is the single source of
 truth, keep it in sync if the bitstream changes.
@@ -439,6 +445,146 @@ repeat=True)` is already streaming. `modem_reference`'s `wav_tx.py` frames +
 BPSK-modulates above the DMA layer, which stays out of scope (see the last
 section).
 
+## RX analog gain implemented (2026-09-16)
+
+`fau_source` gained analog receive gain control: `rx_gain` (constructor +
+`set_rx_gain()`, with a GRC callback) and `gain_backend`, driving the DAC7512
+that sets the AD8334 VGA control voltage for all four ADC channels at once.
+Ported from `/home/gabeg/repos/UWM-dev/scripts/gain-control/dac7512.py` and
+cross-checked against the June 2026 report *Run-Time ADC Gain Control via
+SPI* (`~/Downloads/adc_gain_control_report-1.pdf`).
+
+**Nothing here has run on hardware.** Verified host-side:
+
+- Cross-compiled every new/changed source with the real
+  `arm-xilinx-linux-gnueabi-g++` and the gr-fau-modem recipe sysroot, using
+  the exact flags from the build's own `compile_commands.json` (`-mthumb
+  -mfpu=neon -mfloat-abi=hard -mcpu=cortex-a9 -std=c++17 -fvisibility=hidden
+  -Wall -Wcast-qual ...`), clean.
+- `petalinux-build -c gr-fau-modem` through `do_package_qa` /
+  `do_package_write_rpm` on **both** projects.
+- Extracted the 7010 RPM: `nm -DC` shows
+  `fau_source::make(double, double, int, int, bool, bool, double, double,
+  std::string const&)` with the new signature, the packaged `.block.yml` has
+  the `rx_gain`/`gain_backend` params and the `set_rx_gain` callback, and the
+  pybind extension exports `set_rx_gain`/`gain_backend`.
+- `scripts/extract_gnuradio.sh`: both tarballs contain `usr/bin/fau_gain`
+  and pass the dependency-closure check (fau_gain adds no new shared-library
+  dependency — it links only libc/libstdc++).
+
+### Questions the report settled (don't re-derive)
+
+- **Gain is on the RX board.** The report identifies the receiver as the
+  **M20 (Z7020)** and reports its ILA gain sweep from there. The reference
+  script's "Zynq-7010" docstring is a copy/paste from the TX driver. The
+  old "resolve this against the schematic before trusting the address" note
+  is closed.
+- **The measured curve.** VGAIN 0.2 V -> 0.6 V gives **+19.18 dB** of
+  complex RMS (182.9 -> 1663.7; peak 309.6 -> 2290.9), i.e. ~48 dB/V, close
+  to the AD8334 datasheet's ~50 dB/V. At 0.6 V the signal is at 28 % of ADC
+  full scale with **+11 dB of headroom** and no clip codes; the report
+  extrapolates ~0.85 V as the overload threshold. **This table is the
+  on-hardware acceptance criterion for the port** (step 6).
+- **Only the SLOPE is known.** The absolute gain offset depends on the
+  AD8334's `PREAMP_HI/LO` strap, which was never characterised. That is why
+  `rx_gain` is **volts, not dB** — any absolute dB number would be invented.
+  `dac7512::relative_gain_db()` exists and is explicitly relative.
+- Unrelated but noted in the report: it describes the ILA words as
+  `I = tdata[31:16]`, `Q = tdata[15:0]` — the **opposite** of the
+  `[15:0]=I, [31:16]=Q` this tree uses everywhere. The blocks were NOT
+  changed; the existing convention came from the reference capture driver
+  and is what `fau_source` was written against. If a capture ever comes back
+  with I and Q swapped, this is the first thing to check.
+
+### The SPI1 ownership problem (real, still open)
+
+The 7020 kernel has **`CONFIG_SPI_CADENCE=y`** and `pcw.dtsi` marks
+`&spi1 { status = "okay"; num-cs = <3>; }`, so **cdns_spi is bound to the
+same controller** the `/dev/mem` path bangs. **`CONFIG_SPI_SPIDEV` is not
+set** and no slave node is declared under `&spi1`, so there is also no
+`/dev/spidev*` to use instead. So `auto` resolves to `devmem` today.
+
+That is survivable, and is exactly what the report's measurements were taken
+over, for one reason only: **with no slave nodes, cdns_spi never starts a
+transfer of its own.** It probes, then sits runtime-suspended with the
+controller's clocks gated off — which is why `slcr::enable_spi1_clocks()` is
+mandatory rather than defensive (on a kernel *without* the driver nothing
+turns those clocks on; on one *with* it, the driver turns them off).
+
+If a slave node is ever added under `&spi1`, this becomes a real race. The
+fix is in `docs/README.fau_modem`: `CONFIG_SPI_SPIDEV=y` plus a
+`compatible = "rohm,dh2228fv"` child at `reg = <1>` in the 7020's
+`system-user.dtsi`, then `gain_backend="spidev"`. **Deliberately not done
+here** — it forces a kernel + device-tree rebuild for a path that is not
+needed yet, and step 3 already has to regenerate the device tree.
+
+### Design decisions
+
+- **Volts, not dB** (see above). Clamped to [0, 1.0] V; above ~1 V the
+  AD8334 just saturates. Requests above 0.85 V are programmed but warn.
+- **Constructor throws, setter clamps.** `rx_gain` outside [0, 1] V at
+  construction is almost certainly dB passed where volts were wanted, and
+  fails loudly. `set_rx_gain()` clamps instead — it is reachable from a GRC
+  slider callback, where throwing into the Qt event loop is worse than
+  saturating.
+- **Both are validated in the member-init list, ahead of `d_claim`**, so a
+  bad value raises `ValueError` on any machine instead of being masked by
+  "cannot open /dev/mem". `qa_fau_source.py::test_rejects_bad_parameters`
+  depends on that ordering.
+- **A failed gain write is never fatal.** `apply_gain_locked()` logs and
+  returns false; `d_rx_gain` keeps reporting what the hardware actually
+  holds. The receive path is completely unaffected by a dead SPI write —
+  the stream is still good, just at the old gain. Only the constructor
+  escalates (it means the DAC is unreachable at all, a config problem).
+- **Constructing `fau_source` PROGRAMS the gain.** The DAC is on the PS SPI
+  bus, outside the PL, so — unlike NCO/CIC/frame_len — a fabric reset does
+  **not** wipe it, and it does **not** need reprogramming after every arm.
+  The flip side is that it is state left behind by whatever ran last,
+  including a previous process, so the block sets it at construction to make
+  it deterministic. `gain_backend="none"` opts out.
+- **`set_rx_gain` is the FIRST callback in `fau_modem_fau_source.block.yml`**,
+  which until now deliberately had none. The safety invariant is unchanged
+  and is now stated more precisely in that file: what must stay unreachable
+  from the deployer's live control channel is `set_samp_rate()`, the only
+  setter that re-arms the DMA. Gain touches no part of that path.
+- **spidev paths are resolved through sysfs, never guessed.** `/dev/spidevB.C`'s
+  `B` is the master's `bus_num`, assigned from the device tree's `aliases`
+  node — it is not the controller index, and this SoC's other SPI masters
+  include the QSPI controller owning the boot flash. `spidev_path()` confirms
+  each candidate resolves to `e0007000.spi` before using it. Writing a DAC
+  frame into a flash chip select is not a risk worth taking to save a lookup.
+- **Chip select 1, not 2.** `SPI1_SS2` on the same bus goes to the LTC2171
+  ADC for its own configuration. Only `SS1` is the gain DAC.
+
+### Files added/changed
+
+- `lib/hw/dac7512.{h,cc}` (new) — the driver, `FAU_MODEM_HW_EXPORT`ed like
+  `cic_rate`/`dds_nco` so the QA tests can link its pure math.
+- `lib/hw/slcr.{h,cc}` — added `enable_spi1_clocks()` (APER + SPI ref clock
+  ungate, preserving the boot stage's source/divisor). Unlike
+  `fabric_reset()` it touches nothing on the fabric and is safe while
+  streaming.
+- `lib/hw/board_map.h` — `rx_board::PS_SPI1_BASE/PS_SPI1_SIZE/DAC7512_SS_INDEX`.
+- `include/gnuradio/fau_modem/fau_source.h`, `lib/fau_source_impl.{h,cc}` —
+  `rx_gain`/`gain_backend` ctor params, `set_rx_gain()`, `rx_gain()`,
+  `gain_backend()`.
+- `grc/fau_modem_fau_source.block.yml` — the two parameters, the
+  `set_rx_gain` callback, an `0 <= rx_gain <= 1.0` assert, docs.
+- `python/fau_modem/bindings/fau_source_python.cc` + docstring template —
+  hash bumped to `28f94f9366a202216003efeb53b787d3`.
+- `lib/qa_fau_source.cc` — six new cases over the DAC math (code/volt
+  round-trip, full-scale saturation, VGA clamp, relative dB against the
+  report's measured sweep, backend parsing).
+- `python/fau_modem/qa_fau_source.py` — host-safe rejection tests plus two
+  `FAU_MODEM_HW_TEST=1` gain tests.
+- `apps/fau_gain.cc` (new) + `apps/CMakeLists.txt` + `FILES:${PN}` — a
+  packaged CLI (`--gain`, `--volts`, `--code`, `--sweep`, `--power-down`,
+  `--backend`) linking the same `dac7512.cc` the block uses, so it tests the
+  shipped driver rather than a parallel one. Packaged from the start, per the
+  lesson above about tests that cannot be run.
+- `docs/README.fau_modem`, `MANIFEST.md` — gain section, including the
+  device-tree fragment for the spidev path.
+
 ## What's left, in order
 
 ### 1. Bring-up tests on hardware (before trusting the blocks at all)
@@ -559,39 +705,26 @@ regenerated device tree picks it up in the same pass. Do **not**
 is unset on both boards, so the PL loads from `BOOT.BIN` via FSBL — a stale
 `BOOT.BIN` on the SD card is the most likely way this silently doesn't take.
 
-### 4. Fix the 7020 layer gap
+### 4. 7020 layer gap — RESOLVED (verified 2026-09-16)
 
-Confirmed again this session: `build_7020/petalinux_7020_os/build/conf/bblayers.conf`
-does not include `meta-fau-modem` (7010's does), even though 7020's
-`petalinuxbsp.conf` already has `IMAGE_INSTALL:append = " gr-fau-modem"`.
-This is exactly why `extract_gnuradio.sh` correctly failed to find
-`gr-fau-modem` for board 7020 this session.
+`build_7020/petalinux_7020_os/build/conf/bblayers.conf` now includes
+`meta-fau-modem`, `petalinux-build -c gr-fau-modem` succeeds in the 7020
+project, and `scripts/extract_gnuradio.sh` packages both boards cleanly
+("Both boards packaged cleanly", 7010 and 7020 tarballs each with the
+`gr-fau-modem` RPM and a passing dependency-closure check). Nothing left here.
 
-Fix: `build_7020/petalinux_7020_os/project-spec/configs/config`, set
-`CONFIG_USER_LAYER_1` to the absolute path of `components/layers/meta-fau-modem`
-(mirroring 7010's config), then `petalinux-config --silentconfig` to
-regenerate `bblayers.conf` (don't hand-edit it, it's regenerated on every
-configure).
+**But remember to build BOTH projects.** The 7020 pool was sitting on a stale
+`gr-fau-modem` RPM (r0.6) for several sessions while 7010 was at r0.22, so
+`extract_gnuradio.sh` was quietly shipping an old module to the RX board. The
+script does not compare the two, and nothing else warns. Run
+`petalinux-build -c gr-fau-modem` in **both** `build_7010/petalinux_7010_os`
+and `build_7020/petalinux_7020_os` before packaging — and note that RX-only
+work (gain) matters on the 7020, TX-only work on the 7010.
 
-### 5. RX gain (explicitly deferred this session, not started)
+### 5. RX gain — IMPLEMENTED (2026-09-16), not yet run on hardware
 
-`fau_source` has no gain control today. The reference
-(`modem_reference/scripts/gain-control/dac7512.py`) drives a DAC7512 on PS
-SPI1 (`0xE0007000`) after ungating its clocks via SLCR, setting the AD8334
-VGA gain voltage on all four ADC channels at once (0–1.0 V, ~50 dB/V slope).
-
-When picked up, mirror `hw::slcr`/`hw::mmio` style: a small `hw::dac7512`
-class (`set_vga_gain_volts(double)`, `power_down()`), SPI mode 1
-(`CPOL=0, CPHA=1`), manual CS + manual start, 16-bit frame with CS held low
-across both bytes. Expose as a runtime-settable `rx_gain` parameter on
-`fau_source` (genuinely runtime-safe — one SPI transaction, no DMA
-involvement, unlike `set_samp_rate`). Before wiring it in: **check the
-reference's docstring says Zynq-7010, but gain logically belongs on the RX
-board (7020)** — resolve that discrepancy against the actual schematic
-before trusting the address. Also decide `gain_backend: {auto, devmem,
-spidev}` — if a Cadence SPI kernel driver (`CONFIG_SPI_CADENCE`) ever gets
-bound to SPI1, banging its registers from `/dev/mem` would race with it;
-`auto` should prefer `/dev/spidev1.1` if it exists.
+`fau_source` now carries analog receive gain. See the 2026-09-16 section
+below for the details; what remains is running it on the M20.
 
 ### 6. On-hardware acceptance tests (after 1–4 above)
 
@@ -605,6 +738,12 @@ bound to SPI1, banging its registers from `/dev/mem` would race with it;
   process, 30× in a loop — no `SGSlvErr`/`SGDecErr` escalation. This is the
   specific failure mode the teardown discipline (see above) exists to
   prevent, and it only shows up after many runs.
+- RX gain: `fau_gain --sweep 0.2 0.6 0.1 2` on the 7020 while capturing, and
+  confirm the received amplitude reproduces the gain-control report's table
+  (peak 309.6 → 2290.9, RMS 182.9 → 1663.7, +19.18 dB over the 0.4 V span).
+  That table is the acceptance criterion — it was measured on this exact
+  board with the reference Python driver, so any divergence is this C++
+  port's fault, not the hardware's.
 
 ## Explicitly out of scope (do not implement without being asked)
 
