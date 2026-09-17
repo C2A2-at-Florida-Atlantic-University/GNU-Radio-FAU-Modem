@@ -1179,13 +1179,41 @@ one). **Not done yet:** wiring this into `fau-deploy`'s own preflight (e.g.
 warning if the desktop no-op package is what's on path when generating for
 board deploy) — no such check exists today.
 
-**Future idea, not yet scoped for V1:** a whitelist of source/sink blocks
-allowed to "stick around" when deploying to the board — in practice only
-software sources/sinks (`fau_source`/`fau_sink`, file/vector/null blocks,
-etc.); any other SDR-hardware source/sink (UHD, RTL-SDR, etc.) would need to
-be disabled and stripped from the flowgraph before deploy, the same way GUI
-blocks are stripped in the headless transform below. Likely belongs as a new
-preflight gate alongside Gate 1/2, not yet designed.
+**DONE (2026-09-16), and it was not a future idea for long:** deploying a
+bench flowgraph that fed a USRP and the board's DAC from one chirp generator
+— the ordinary way to put the same waveform through both — died on the board
+with `ImportError: cannot import name 'uhd' from 'gnuradio'`, before a single
+block was constructed. The image has no `gr-uhd`.
+
+Implemented in `core/headless.py` as `FOREIGN_HARDWARE` /
+`_check_foreign_hardware`, not as a separate preflight gate: it needs the
+null-sink splice and the derived-copy discipline the transform already has,
+and the operator wants one report, not two. It ended up **not** being the
+whitelist this paragraph imagined — a whitelist has to be complete to be
+safe, and nobody can enumerate every block GRC ships. Blocklisting the
+peripheral families instead (`uhd_`, `soapy_`, `osmosdr_`, `rtlsdr_`, `iio_`,
+…, plus `audio_*`) is the same bet `classify` already makes for `qtgui_`, and
+it fails in the recoverable direction: an unlisted peripheral reaches the
+board and fails loudly at import, exactly as it does today, rather than a
+legitimate core block being silently deleted.
+
+Direction is read off the flowgraph's **stream connections**, not off a
+per-block table:
+
+- A peripheral nothing consumes the output of (any *sink*, and a dangling
+  source) is **stripped**, with a null sink spliced onto anything it
+  orphaned — same machinery, same report, as a GUI sink.
+- A peripheral that **feeds** the rest of the flowgraph is **refused**.
+  Deleting a producer leaves a downstream input unconnected, GNU Radio
+  rejects that topology, and the only stand-in is a `blocks_null_source`
+  quietly pushing zeros into a chain built for real samples. No flag
+  overrides this — unlike a GUI control there is no last value to freeze, so
+  it is the operator's call. The message says to disable it in GRC along with
+  whatever only it fed, or to split the desktop half into its own flowgraph.
+
+A **disabled** peripheral still needs nothing done to it — GRC's generator
+omits disabled blocks and their connections — and that manual workaround
+keeps working; the gate just means nobody has to remember it.
 
 ## Phase 1 — blocks in desktop GRC (trivial, prerequisite)
 
@@ -1288,7 +1316,13 @@ framing).
   so "core is safe" is **false**; must check against the image's actual block
   set. Source of truth: **enumerate the board's installed block YAMLs on
   connect** (natural now that we already talk to the board) during dev; later a
-  build-time manifest emitted by the PetaLinux build.
+  build-time manifest emitted by the PetaLinux build. **Still open**, but its
+  two known-costly cases are now handled ahead of it by the transform, which
+  needs no board: `qtgui_*` (see the headless transform) and the SDR/audio
+  peripherals (see `FOREIGN_HARDWARE`, above). The residue this gate would
+  still catch is a block that is *core* GNU Radio on the desktop and absent
+  from the image — `gr-digital`, `gr-dtv`, `gr-vocoder` — which no name
+  pattern can distinguish from a block that is present.
 - **Target inference.** `fau_sink` → 7010 (TX); `fau_source` → 7020 (RX) — two
   *physically separate* boards. Both present in one flowgraph → **reject**
   (can't run on a single board). Override via explicit port/host selection.

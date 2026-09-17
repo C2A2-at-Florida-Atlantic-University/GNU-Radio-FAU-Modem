@@ -81,6 +81,41 @@ def msg_button(name="ping"):
                   "value": '"go"', "gui_hint": ""})
 
 
+def usrp_sink(name="usrp_tx", type_name="fc32", state=True):
+    """A USRP sink as GRC writes it, trimmed to the parameters that matter
+    here. The real block carries 32 copies of every per-channel parameter;
+    none of them change what the transform does."""
+    return block(name, "uhd_usrp_sink",
+                 {"type": type_name, "dev_addr": '"addr=192.168.11.13"',
+                  "nchan": "1", "samp_rate": "480e3",
+                  "center_freq0": "center_freq", "gain0": "0"},
+                 state=state)
+
+
+def usrp_source(name="usrp_rx", type_name="fc32", state=True):
+    return block(name, "uhd_usrp_source",
+                 {"type": type_name, "dev_addr": '"addr=192.168.11.13"',
+                  "nchan": "1", "samp_rate": "480e3",
+                  "center_freq0": "center_freq", "gain0": "0"},
+                 state=state)
+
+
+def tx_with_usrp(fg_id="tx_demo", state=True):
+    """The bench case this gate exists for: one chirp generator feeding the
+    board's DAC *and* a USRP, so the same waveform goes out of both. The
+    USRP half cannot follow the flowgraph onto the board."""
+    return doc([
+        block("samp_rate", "variable", {"value": "480e3"}),
+        block("chirp", "analog_sig_source_x",
+              {"type": "complex", "freq": "1e3", "amp": "0.5"}),
+        fau_sink(),
+        usrp_sink(state=state),
+    ], [
+        ("chirp", "0", "fau_tx", "0"),
+        ("chirp", "0", "usrp_tx", "0"),
+    ], fg_id=fg_id)
+
+
 def doc(blocks, connections=(), fg_id="demo", file_format=1,
         generate_options="qt_gui", run_options="prompt"):
     d = {

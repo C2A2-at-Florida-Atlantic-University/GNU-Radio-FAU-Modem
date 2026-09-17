@@ -268,6 +268,163 @@ class TestThrottle(HeadlessTestCase):
         self.assertTrue(any("Throttle" in w for w in rep.warnings))
 
 
+class TestForeignHardwareClassification(unittest.TestCase):
+    def _classify(self, type_id):
+        return headless.classify(grcfile.Block({"name": "x", "id": type_id}))
+
+    def test_the_listed_peripherals(self):
+        self.assertEqual(self._classify("uhd_usrp_sink"), "foreign_hw")
+        self.assertEqual(self._classify("uhd_usrp_source"), "foreign_hw")
+        self.assertEqual(self._classify("rtlsdr_source"), "foreign_hw")
+        self.assertEqual(self._classify("audio_sink"), "foreign_hw")
+
+    def test_families_are_caught_by_their_prefix(self):
+        # The point of the prefix rule: nobody enumerates every RFNoC or
+        # Soapy block, and an unlisted one is still an ImportError on the
+        # board.
+        self.assertEqual(self._classify("uhd_rfnoc_tx_streamer"), "foreign_hw")
+        self.assertEqual(self._classify("soapy_hackrf_sink"), "foreign_hw")
+        self.assertEqual(self._classify("iio_pluto_source"), "foreign_hw")
+
+    def test_core_blocks_are_untouched_by_the_prefix_rule(self):
+        for type_id in ("blocks_file_sink", "analog_sig_source_x",
+                        "filter_fir_filter_ccf", "network_udp_source",
+                        "fau_modem_fau_sink", "digital_constellation_modulator"):
+            self.assertIsNone(self._classify(type_id), type_id)
+
+
+class TestForeignHardware(HeadlessTestCase):
+    """Peripherals wired to the desktop, in a flowgraph bound for the board.
+
+    The failure this replaces was not subtle and not recoverable: the
+    generated .py died on `from gnuradio import uhd` on the board, before
+    any block was constructed, with nothing in the deployer's own output
+    hinting at why.
+    """
+
+    def test_a_usrp_sink_is_stripped_and_the_fau_branch_survives(self):
+        fg, rep = self._transform(fx.tx_with_usrp())
+        names = self._names(fg)
+        self.assertNotIn("usrp_tx", names)
+        self.assertIn("fau_tx", names)
+        self.assertIn("chirp", names)
+        self.assertTrue(any(c.kind == "stripped" and c.block == "usrp_tx"
+                            for c in rep.changes))
+
+    def test_the_operator_is_told_the_desktop_half_is_gone(self):
+        _fg, rep = self._transform(fx.tx_with_usrp())
+        self.assertTrue(any("usrp_tx" in w for w in rep.warnings))
+
+    def test_its_connections_go_with_it(self):
+        fg, _rep = self._transform(fx.tx_with_usrp())
+        for c in fg.connections:
+            self.assertNotEqual(c.dst, "usrp_tx")
+            self.assertNotEqual(c.src, "usrp_tx")
+
+    def test_a_branch_that_only_fed_the_usrp_gets_a_null_sink(self):
+        # Without the splice GNU Radio rejects the topology outright, which
+        # is the same class of failure one layer further along.
+        document = fx.doc([
+            fx.fau_sink(),
+            fx.block("chirp", "analog_sig_source_x", {"type": "complex"}),
+            fx.block("noise", "analog_noise_source_x", {"type": "complex"}),
+            fx.usrp_sink(),
+        ], [
+            ("chirp", "0", "fau_tx", "0"),
+            ("noise", "0", "usrp_tx", "0"),
+        ])
+        fg, rep = self._transform(document)
+        spliced = [b for b in fg.blocks if b.id == "blocks_null_sink"]
+        self.assertEqual(len(spliced), 1)
+        # fc32 is a gr_complex on the host: the null sink has to agree, and
+        # it must not have been reached by the "assumes complex" warning
+        # path, which would mean the item size was a guess.
+        self.assertEqual(spliced[0].param("type"), "complex")
+        self.assertFalse([w for w in rep.warnings if "assumes complex" in w])
+        self.assertTrue(any(c.src == "noise" and c.dst == spliced[0].name
+                            for c in fg.connections))
+
+    def test_a_shared_branch_needs_no_null_sink(self):
+        # `chirp` still feeds fau_tx, so its output port is not orphaned.
+        fg, _rep = self._transform(fx.tx_with_usrp())
+        self.assertEqual([b for b in fg.blocks if b.id == "blocks_null_sink"],
+                         [])
+
+    def test_sc16_and_sc8_splice_by_item_size(self):
+        for declared, expected in (("sc16", "int"), ("sc8", "short")):
+            document = fx.doc([
+                fx.fau_sink(),
+                fx.block("src", "analog_sig_source_x", {"type": "complex"}),
+                fx.usrp_sink(type_name=declared),
+            ], [("src", "0", "usrp_tx", "0")])
+            fg, rep = self._transform(document)
+            spliced = [b for b in fg.blocks if b.id == "blocks_null_sink"]
+            self.assertEqual(spliced[0].param("type"), expected, declared)
+            self.assertFalse([w for w in rep.warnings if "assumes" in w])
+
+    def test_a_usrp_source_is_refused_rather_than_faked(self):
+        document = fx.doc([
+            fx.fau_sink(),
+            fx.usrp_source(),
+            fx.block("amp", "blocks_multiply_const_vxx", {"type": "complex"}),
+        ], [
+            ("usrp_rx", "0", "amp", "0"),
+            ("amp", "0", "fau_tx", "0"),
+        ])
+        with self.assertRaises(GrcError) as cm:
+            self._transform(document)
+        message = str(cm.exception)
+        self.assertIn("usrp_rx", message)
+        self.assertIn("uhd_usrp_source", message)
+        # It has to say what to do about it, since there is no flag that
+        # makes this one go away.
+        self.assertIn("isable", message)
+
+    def test_a_peripheral_with_no_stream_consumer_is_strippable(self):
+        # A dangling USRP source is a producer nothing reads, so nothing
+        # downstream can be left orphaned by removing it.
+        document = fx.doc([fx.fau_sink(),
+                           fx.block("src", "analog_sig_source_x",
+                                    {"type": "complex"}),
+                           fx.usrp_source()],
+                          [("src", "0", "fau_tx", "0")])
+        fg, _rep = self._transform(document)
+        self.assertNotIn("usrp_rx", self._names(fg))
+
+    def test_a_message_port_does_not_make_it_a_producer(self):
+        # A UHD sink's async-message port makes it a `src` in the
+        # connection list; dropping that edge orphans nothing, so it must
+        # not be mistaken for a source and refused.
+        document = fx.doc([
+            fx.fau_sink(),
+            fx.block("src", "analog_sig_source_x", {"type": "complex"}),
+            fx.usrp_sink(),
+            fx.block("dbg", "blocks_message_debug", {}),
+        ], [
+            ("src", "0", "fau_tx", "0"),
+            ("src", "0", "usrp_tx", "0"),
+            ("usrp_tx", "async_msgs", "dbg", "print"),
+        ])
+        fg, _rep = self._transform(document)
+        self.assertNotIn("usrp_tx", self._names(fg))
+
+    def test_a_disabled_peripheral_is_left_exactly_as_it_is(self):
+        # This is the manual workaround the gate replaces -- GRC already
+        # omits disabled blocks from generation -- and it has to keep
+        # working, including keeping the block in the derived .grc so the
+        # audit copy still reads like the original.
+        fg, rep = self._transform(fx.tx_with_usrp(state="disabled"))
+        self.assertIn("usrp_tx", self._names(fg))
+        self.assertFalse([c for c in rep.changes if c.block == "usrp_tx"])
+        self.assertFalse([w for w in rep.warnings if "usrp_tx" in w])
+
+    def test_the_users_file_is_not_touched(self):
+        document = fx.tx_with_usrp()
+        before = copy.deepcopy(document)
+        self._transform(document)
+        self.assertEqual(document, before)
+
+
 class TestWrite(HeadlessTestCase):
     def test_the_derived_file_reloads_as_a_flowgraph(self):
         doc, _rep = headless.transform(self._fg(fx.rx_with_gui()))

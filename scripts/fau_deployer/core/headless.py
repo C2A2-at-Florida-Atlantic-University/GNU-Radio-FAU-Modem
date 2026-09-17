@@ -5,13 +5,26 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-"""Turn a GUI flowgraph into a headless one, on a derived copy.
+"""Make a desktop flowgraph runnable on the board image, on a derived copy.
 
-The board image is headless: there is no X, no Qt and no `gr-qtgui`, so a
-`qt_gui` flowgraph's generated `.py` dies on `from PyQt5 import Qt` before
-it reaches a single block. "Make it headless" and "remove every GUI block"
-are the same operation, not two -- the `no_gui` generator emits no widget
-parent, so a leftover `qtgui_*` block fails code generation outright.
+Two things stand between a `.grc` as GRC saved it and a `.py` the board can
+run, and they are the same kind of problem: the module is not there.
+
+**No GUI.** The board image is headless -- no X, no Qt, no `gr-qtgui` -- so
+a `qt_gui` flowgraph's generated `.py` dies on `from PyQt5 import Qt`
+before it reaches a single block. "Make it headless" and "remove every GUI
+block" are the same operation, not two -- the `no_gui` generator emits no
+widget parent, so a leftover `qtgui_*` block fails code generation
+outright.
+
+**No other radios.** The image ships core GNU Radio plus `gr-fau_modem`,
+and nothing else: no `gr-uhd`, `gr-soapy`, `gr-osmosdr`, `gr-iio` or
+`gr-audio`. A bench flowgraph that feeds a USRP and the board's DAC from
+one signal chain -- the ordinary way to put the same waveform through both
+-- died on `from gnuradio import uhd`, again before a single block was
+built. Those peripherals are stripped for the same reason and by the same
+machinery as a GUI sink; see FOREIGN_HARDWARE below for where the two part
+company.
 
 **The user's `.grc` is never touched.** Everything here works on a
 deep-copied document written out as a separate `*.headless.grc`, which is
@@ -91,6 +104,37 @@ MESSAGE_ONLY_CONTROLS = frozenset([
     "qtgui_graphicoverlay",
 ])
 
+# Peripherals attached to the DESKTOP, not to the board: a USRP, an RTL
+# dongle, a sound card. The board image has no module for any of them, so
+# the generated `.py` fails at import -- which is why these are stripped
+# here rather than left to fail out on the hardware.
+#
+# Direction is deliberately NOT read off this table. A USRP sink can be
+# deleted; a USRP source cannot, because something downstream is consuming
+# what it produces -- and that is a question about the flowgraph, not about
+# the block type, so `_check_foreign_hardware` reads it off the connection
+# list instead. That also means a block id nobody here has heard of still
+# gets the right answer.
+FOREIGN_HARDWARE = frozenset([
+    "uhd_usrp_source", "uhd_usrp_sink", "uhd_amsg_source",
+    "osmosdr_source", "osmosdr_sink",
+    "rtlsdr_source",
+    "audio_source", "audio_sink",
+])
+
+# Families with too many members to list, and whose membership moves with
+# the GNU Radio version: every `uhd_rfnoc_*` block, every
+# `soapy_<device>_{source,sink}`, the whole gr-iio/PlutoSDR set. Matching on
+# the prefix is the same bet `classify` already makes for `qtgui_`: a block
+# this module has never seen but which is plainly a radio peripheral is
+# better caught by its name than waved through into an ImportError on the
+# board. None of these prefixes collide with core GNU Radio's own
+# (`blocks_`, `analog_`, `digital_`, `filter_`, `fft_`, `network_`, ...).
+FOREIGN_HARDWARE_PREFIXES = (
+    "uhd_", "soapy_", "osmosdr_", "rtlsdr_", "iio_", "limesdr_",
+    "bladeRF_", "airspy_", "hackrf_", "funcube_", "fcd_",
+)
+
 # Stream type of the port a sink consumes, for the ones whose block
 # definition carries no `type` parameter to read it off. Anything absent
 # from both falls back to complex with a warning -- a wrong item size is an
@@ -101,7 +145,15 @@ _SINK_DEFAULT_TYPE = {
     "qtgui_bercurve_sink": "float",
     "qtgui_compass": "float",
     "qtgui_vector_sink_f": "float",
+    # gr-audio takes interleaved float and says so nowhere in its params.
+    "audio_sink": "float",
 }
+
+# The SDR blocks spell their host item type in that same `type` parameter,
+# but in UHD's vocabulary rather than GRC's. A null sink only cares about
+# the item SIZE: `sc16` is a pair of int16s (4 bytes, like an int) and
+# `sc8` a pair of int8s (2 bytes, like a short).
+_HW_ITEM_TYPES = {"fc32": "complex", "sc16": "int", "sc8": "short"}
 
 # qtgui `type` parameter value -> blocks_null_sink `type` value. The
 # `msg_*` variants describe a message port, which never needs a splice.
@@ -243,7 +295,19 @@ def classify(block):
         return "message_only"
     if bid.startswith("qtgui_") or bid.startswith("variable_qtgui_"):
         return "unknown_gui"
+    if is_foreign_hardware(bid):
+        return "foreign_hw"
     return None
+
+
+def is_foreign_hardware(type_id):
+    """True if `type_id` drives a peripheral the board image cannot import.
+
+    Checked by exact id first and by family prefix second, so a
+    `uhd_rfnoc_*` or `soapy_*` block nobody listed still gets caught.
+    """
+    return (type_id in FOREIGN_HARDWARE
+            or type_id.startswith(FOREIGN_HARDWARE_PREFIXES))
 
 
 def _null_sink_type(sink_block, report_obj):
@@ -253,6 +317,8 @@ def _null_sink_type(sink_block, report_obj):
         return None  # a message port: nothing to splice
     if declared in _NULL_SINK_TYPES:
         return _NULL_SINK_TYPES[declared]
+    if declared in _HW_ITEM_TYPES:
+        return _HW_ITEM_TYPES[declared]
     default = _SINK_DEFAULT_TYPE.get(sink_block.id)
     if default:
         return default
@@ -320,9 +386,10 @@ def transform(fg, allow_message_controls=False, enable_controls=True):
 
     _force_options(work, rep)
     blocked = _check_message_controls(work, rep, allow_message_controls)
+    foreign = _check_foreign_hardware(work, rep)
     if enable_controls:
         _extract_controls(work, rep)
-    removed = _strip_and_freeze(work, rep, blocked)
+    removed = _strip_and_freeze(work, rep, blocked, foreign)
     _splice_null_sinks(work, rep, removed)
     _flag_throttles(work, rep)
     if enable_controls and rep.controls:
@@ -456,8 +523,61 @@ def _check_message_controls(fg, rep, allow):
     return blocked
 
 
-def _strip_and_freeze(fg, rep, blocked):
-    """Delete GUI sinks/decoration, freeze GUI variables in place.
+def _check_foreign_hardware(fg, rep):
+    """Find the peripheral blocks the board image cannot import, and decide
+    which of them can be stripped.
+
+    Returns the set of instance names to remove. Raises GrcError for any
+    whose *stream output* something else consumes, because there the strip
+    is not available: deleting a producer leaves a downstream input port
+    with nothing on it, GNU Radio rejects that topology outright, and the
+    only thing that could fill it is a `blocks_null_source` quietly pushing
+    zeros -- as fast as the scheduler asks for them -- into a chain built
+    for real samples. A GUI control at least has a last value to freeze;
+    this has nothing, so it is the operator's call and not a default.
+
+    A *disabled* peripheral block needs nothing done to it: GRC's generator
+    omits disabled blocks and their connections, so it never reaches the
+    import. That is the manual workaround this gate replaces, and it keeps
+    working.
+    """
+    foreign = [b for b in fg.enabled_blocks if classify(b) == "foreign_hw"]
+    if not foreign:
+        return set()
+
+    # Only STREAM outputs pin a block in place. A UHD sink's async-message
+    # port makes it a `src` in the connection list too, and dropping that
+    # edge orphans nothing.
+    produces = {c.src for c in fg.connections if not c.is_message}
+    blocking = [b for b in foreign if b.name in produces]
+
+    if blocking:
+        raise GrcError(
+            "this flowgraph takes samples from radio hardware the board "
+            "cannot talk to: %s. The board image is core GNU Radio plus the "
+            "FAU Modem blocks and nothing else -- no gr-uhd, gr-soapy, "
+            "gr-osmosdr or gr-iio -- so the generated .py dies on its "
+            "import before a single block is constructed. A peripheral that "
+            "only consumes samples is dropped automatically, but this one "
+            "feeds the rest of the flowgraph, and the only stand-in would "
+            "be a null source pushing zeros into a chain built for real "
+            "samples. In GRC, disable it (right-click -> Disable) together "
+            "with whatever only it fed, or split the desktop half off into "
+            "its own flowgraph."
+            % ", ".join("%s (%s)" % (b.name, b.id) for b in blocking))
+
+    for b in foreign:
+        rep.warn(
+            "%s (%s) drives hardware attached to this desktop, not to the "
+            "board. It is stripped from the board's copy, so nothing the "
+            "flowgraph does there will reach it -- run the desktop half "
+            "separately if you need both at once." % (b.name, b.id))
+    return {b.name for b in foreign}
+
+
+def _strip_and_freeze(fg, rep, blocked, foreign=()):
+    """Delete GUI sinks/decoration and the consented peripherals, freeze
+    GUI variables in place.
 
     Returns {instance name: the Block it was} for everything deleted, which
     is what the null-sink splice needs to know the stream type of each port
@@ -484,6 +604,14 @@ def _strip_and_freeze(fg, rep, blocked):
         if kind in ("sink", "decoration"):
             removed[b.name] = b
             rep.change("stripped", b.name, b.id)
+            continue
+
+        if kind == "foreign_hw" and b.name in foreign:
+            # Consented to by _check_foreign_hardware, which has already
+            # established that nothing downstream depends on its output.
+            removed[b.name] = b
+            rep.change("stripped", b.name,
+                       "%s -- the board image has no module for it" % b.id)
             continue
 
         if kind == "variable":
